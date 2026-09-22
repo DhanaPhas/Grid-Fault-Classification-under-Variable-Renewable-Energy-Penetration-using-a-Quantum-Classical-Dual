@@ -1,0 +1,15 @@
+# Versions used for the paper. Run `pip freeze` in the paper environment to
+# pin the remaining packages exactly.
+pandapower==3.3.2
+qiskit==2.3.0
+qiskit-aer==0.17.2
+qiskit-ibm-runtime==0.45.0
+qiskit-machine-learning==0.9.0
+scikit-learn==1.7.2
+numpy
+pandas
+scipy
+matplotlib
+
+# Optional: large speed-up for pandapower power flow / short-circuit
+# numba

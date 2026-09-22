@@ -38,11 +38,15 @@ VRE30 and VRE80 mean installed renewable capacity equal to 30% and 80% of the to
 │   └── Mod_IEEE.py      # IEEE network builders and dataset generation
 ├── preprocessing.py     # scaling + PCA split builder
 ├── kernels.py           # classical and quantum kernels, kernel caching
+├── models.py            # CV tuning for classical, quantum and dual-kernel SVC
+├── stats.py             # bootstrap CIs, permutation / McNemar tests, Holm correction
+├── reporting.py         # tables, classification reports, confusion matrices, figures
+├── run_experiment.py    # command-line entry point for the full pipeline
 ├── requirements.txt
 └── README.md
 ```
 
-Planned (in progress): `models.py` (tuning), `stats.py` (statistical tests), `reporting.py` (tables and figures), `run_experiment.py` (entry point) and a `results/` folder.
+Each run writes to `results/<dataset>_<quantum kernel>/`.
 
 ## Installation
 
@@ -71,26 +75,62 @@ Installing `numba` is optional but speeds up pandapower considerably.
 
 Run all commands from the repository root.
 
-Generate a dataset:
+### Full experiment
+
+```bash
+# fast end-to-end check (tiny data, reduced grids; a few minutes)
+python run_experiment.py --dataset ieee38 --quick
+
+# full run
+python run_experiment.py --dataset ieee38 --kernel fidelitystatevectorkernel
+python run_experiment.py --dataset ieee68 --kernel fidelityquantumkernel \
+    --seeds 14 22 35 56 90 257 301 412 555 777
+```
+
+Options: `--dataset {ieee38,ieee68,ieee123}`, `--kernel {fidelitystatevectorkernel,fidelityquantumkernel}`, `--seeds ...`, `--report-seed {first,best,<seed>}`, `--quick`, `--show`.
+
+From Jupyter:
+
+```python
+import run_experiment
+out = run_experiment.main(["--dataset", "ieee38", "--quick"])
+```
+
+### Outputs
+
+| File | Content |
+|---|---|
+| `repeated_seed_all_pairwise_metric_tests.csv` | **Primary result.** Mean paired difference across seeds for every model pair and metric, exact sign-flip permutation p-value with Holm correction, bootstrap CI, t-test and Wilcoxon for reference |
+| `repeated_seed_model_summary.csv` | Mean, std, min and max of each metric across seeds |
+| `seed_summary.csv`, `seed_level_predictions.csv` | Per-seed metrics and every individual test prediction |
+| `model_cost_summary.csv` | Tuning time per seed; the "Dual (end-to-end)" row includes the classical and quantum stages the dual kernel depends on |
+| `reporting_seed_*` | Detailed single-split report: model comparison, bootstrap CIs, McNemar tests, classification reports, confusion matrices, alpha curve |
+| `repeated_seed_acc.png`, `repeated_seed_auc.png` | Mean ± std across seeds |
+| `run_config.json` | Arguments, all config values and package versions for the run |
+
+### Statistical notes
+
+- Claims should rest on the repeated-seed table. The single-seed tests describe one split only.
+- With *n* seeds the smallest possible two-sided sign-flip p-value is 2/2^n. With Holm over three model pairs, **6 seeds can never give p < 0.05** (minimum 0.094). Use at least 7 seeds; 10 or more is advisable. The script prints a warning when this applies.
+- The reporting seed defaults to the first seed (pre-declared). `--report-seed best` reproduces the original selection of the seed most favourable to the dual kernel and should not be used for headline results.
+- Timing is only meaningful on a cold cache, because cached quantum kernels load in seconds.
+
+### Individual modules
 
 ```python
 from data.Mod_IEEE import generate_dataset
+import preprocessing, models
 
 df = generate_dataset(N=650, vre_percent=0, random_seed=14, dataset="ieee38")
-```
-
-Build the full train/test split used by the models:
-
-```python
-import preprocessing
 
 split = preprocessing.prepare_vre0_split_and_vre_tests(seed=14)
 preprocessing.describe_split(split)
+
+classical, quantum, dual = models.tune_all(split)
+print(models.summarize_results(classical, quantum, dual))
 ```
 
-The network and quantum-kernel mode are selected in `config.py` (`SELECTED_DATASET`, `SELECTED_QUANTUM_KERNEL`). Generated datasets and quantum kernel matrices are cached in `config.CACHE_DIR` and reused on later runs.
-
-Full experiment reproduction instructions will be added with `run_experiment.py`.
+Generated datasets and quantum kernel matrices are cached in `config.CACHE_DIR` and reused on later runs.
 
 ## Citation
 

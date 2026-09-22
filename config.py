@@ -131,9 +131,9 @@ USE_PRECOMPUTED_KERNEL_CACHE = True
 
 CACHE_DIR = "pandapower_kernel_cache_conf_2_5"
 
-# Result CSVs were written into CACHE_DIR in the original script. Point this
-# somewhere else (e.g. "results") to keep outputs separate from caches.
-RESULTS_DIR = CACHE_DIR
+# Root folder for result tables and figures. run_experiment.py writes each
+# run into RESULTS_DIR/<dataset>_<quantum kernel>/.
+RESULTS_DIR = "results"
 
 
 def make_cache_pipeline_tag(dataset, quantum_kernel):
@@ -162,4 +162,31 @@ CACHE_PIPELINE_TAG = make_cache_pipeline_tag(SELECTED_DATASET, SELECTED_QUANTUM_
 def ensure_dirs():
     """Create cache and results folders. Call once at the start of a run."""
     os.makedirs(CACHE_DIR, exist_ok=True)
-    os.makedirs(RESULTS_DIR, exist_ok=True)
+    os.makedirs(run_results_dir(), exist_ok=True)
+
+
+def set_run_options(dataset=None, quantum_kernel=None):
+    """
+    Change dataset / quantum kernel at runtime and refresh derived values.
+
+    Call this BEFORE importing preprocessing, kernels or models: some of their
+    function defaults are read from config when they are imported.
+    """
+    global SELECTED_DATASET, SELECTED_QUANTUM_KERNEL, QUANTUM_KERNEL_MODE, CACHE_PIPELINE_TAG
+    if dataset is not None:
+        dataset = dataset.lower()
+        if dataset not in VALID_DATASET_CHOICES:
+            raise ValueError("dataset must be one of {}".format(sorted(VALID_DATASET_CHOICES)))
+        SELECTED_DATASET = dataset
+    if quantum_kernel is not None:
+        quantum_kernel = quantum_kernel.lower()
+        if quantum_kernel not in VALID_QUANTUM_KERNEL_CHOICES:
+            raise ValueError("quantum_kernel must be one of {}".format(sorted(VALID_QUANTUM_KERNEL_CHOICES)))
+        SELECTED_QUANTUM_KERNEL = quantum_kernel
+    QUANTUM_KERNEL_MODE = SELECTED_QUANTUM_KERNEL
+    CACHE_PIPELINE_TAG = make_cache_pipeline_tag(SELECTED_DATASET, SELECTED_QUANTUM_KERNEL)
+
+
+def run_results_dir():
+    """Results folder for the current dataset / kernel combination."""
+    return os.path.join(RESULTS_DIR, "{}_{}".format(SELECTED_DATASET, SELECTED_QUANTUM_KERNEL))
