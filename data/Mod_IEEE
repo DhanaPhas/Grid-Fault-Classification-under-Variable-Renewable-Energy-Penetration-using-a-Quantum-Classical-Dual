@@ -2,8 +2,7 @@
 Mod_IEEE.py
 
 IEEE 38-bus, 68-bus and 123-bus pandapower network builders plus the
-fault / no-fault dataset generator used by the classical / quantum /
-dual-kernel SVC pipeline.
+fault / no-fault dataset generator used by classification algorithms pipeline.
 
 Typical use from the main pipeline:
 
