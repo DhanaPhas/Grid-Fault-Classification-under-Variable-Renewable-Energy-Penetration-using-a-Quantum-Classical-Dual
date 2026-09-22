@@ -1,6 +1,6 @@
 # Grid Fault Classification under Variable Renewable Energy Penetration using a Quantum-Classical Dual Kernel
 
-This repository contains the code and data generation pipeline for the study of grid fault classification under variable renewable energy penetration using a quantum-classical dual kernel.
+This repository contains the code and data generation pipeline in the paper "Grid Fault Classification under Variable Renewable Energy Penetration using a Quantum-Classical Dual Kernel.
 
 ## Overview
 
