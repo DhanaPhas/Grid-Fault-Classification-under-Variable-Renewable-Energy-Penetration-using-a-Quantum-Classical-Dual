@@ -53,6 +53,16 @@ FAULT_CASES = ["max", "min"]
 CACHE_DIR = "pandapower_kernel_cache_conf_2_5"
 DEFAULT_QUANTUM_KERNEL_TAG = "fidelitystatevectorkernel"
 
+# Extra cache-file suffix per network. Bump a network's entry whenever its
+# generated data changes, so stale CSVs are never silently reloaded.
+# ieee123: renewable capacity rescaled to match the 0.1 load factor (see
+# IEEE123_LOAD_FACTOR); earlier ieee123 caches had ~10x too much VRE.
+DATASET_CACHE_SUFFIX = {
+    "ieee38": "",
+    "ieee68": "",
+    "ieee123": "_vrefix",
+}
+
 
 def default_cache_tag(dataset=SELECTED_DATASET, quantum_kernel=DEFAULT_QUANTUM_KERNEL_TAG):
     return "{}_{}_no_split_vre0_train650_test400_v2".format(dataset.lower(), quantum_kernel.lower())
@@ -689,6 +699,13 @@ IEEE123_LOADS_PU = {
 }
 
 
+# Loads (and therefore renewable capacity) are scaled by this factor so the
+# 123-bus system stays within a realistic 20 kV operating range.
+IEEE123_LOAD_FACTOR = 0.1
+
+# The VRE tables below are sized against the UNSCALED load (~2535 MW), so
+# build_ieee123_net multiplies them by IEEE123_LOAD_FACTOR to keep installed
+# capacity at 30% / 80% of the actual (scaled) load.
 IEEE123_VRE30_PV_DATA = {
     5: 14.75, 9: 14.04, 12: 10.53, 15: 23.88, 17: 15.45, 22: 21.07,
     25: 12.64, 28: 7.72, 30: 17.56, 32: 21.77, 37: 13.34, 38: 14.04,
@@ -732,7 +749,7 @@ def _add_ieee123_base_elements(net, buses):
     s_base_mva = 100.0
     v_base_kv = 20.0
     z_base = (v_base_kv ** 2) / s_base_mva
-    load_factor = 0.1
+    load_factor = IEEE123_LOAD_FACTOR
 
     pp.create_ext_grid(
         net,
@@ -809,6 +826,10 @@ def build_ieee123_net(vre_percent=0, dynamic_profile=True, hours=24, seed=42):
             scale = float(vre_percent) / 30.0
             pv_data = {bus: p_mw * scale for bus, p_mw in IEEE123_VRE30_PV_DATA.items()}
             wind_data = {bus: p_mw * scale for bus, p_mw in IEEE123_VRE30_WIND_DATA.items()}
+
+        # Match renewable capacity to the scaled load (see IEEE123_LOAD_FACTOR).
+        pv_data = {bus: p_mw * IEEE123_LOAD_FACTOR for bus, p_mw in pv_data.items()}
+        wind_data = {bus: p_mw * IEEE123_LOAD_FACTOR for bus, p_mw in wind_data.items()}
 
         for bus_num, p_scaled in pv_data.items():
             idx = pp.create_sgen(
@@ -923,7 +944,9 @@ def generate_dataset(
     cache_tag = cache_tag or default_cache_tag(dataset)
     monitored_buses = DATASET_MONITORED_BUSES[dataset]
 
-    cache_name = "{}_dataset_vre{}_N{}_seed{}.csv".format(cache_tag, vre_percent, N, random_seed)
+    cache_name = "{}{}_dataset_vre{}_N{}_seed{}.csv".format(
+        cache_tag, DATASET_CACHE_SUFFIX.get(dataset, ""), vre_percent, N, random_seed
+    )
     cache_path = os.path.join(cache_dir, cache_name)
     if use_cache and os.path.exists(cache_path):
         print("Loading cached dataset:", cache_path)
