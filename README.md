@@ -4,7 +4,7 @@ This repository contains the code and data generation pipeline in the paper "Gri
 
 ## Overview
 
-This work investigates the use of quantum-classical dual-kernel learning for classifying power-system faults under varying renewable energy penetration levels. The objective is evaluate the quantum-classical dual kernel SVM across different IEEE multi-bus network scales (modified IEEE 38-, 68, and 123-bus), operating conditions, and fault-feature representations rather than to establish a quantum advantage over classical machine learning. The algorithmic pipeline is implemented using IBM \texttt{qiskit} packages and \texttt{scikit-learn} for quantum kernel construction, data preprocessing, model training, and evaluation. Model performance is assessed using cross-validation and held-out test accuracy, with the noisy backend evaluation applied to the IEC 60909 pandapower experiment.
+This work investigates the use of quantum-classical dual-kernel learning for classifying power-system faults under varying renewable energy penetration levels. The objective is evaluate the quantum-classical dual kernel SVM across different IEEE multi-bus network scales (modified IEEE 38-, 68, and 123-bus), operating conditions, and fault-feature representations rather than to establish a quantum advantage over classical machine learning. The algorithmic pipeline is implemented using IBM qiskit packages and scikit-learn for quantum kernel construction, data preprocessing, model training, and evaluation. Model performance is assessed using cross-validation and held-out test accuracy, with the noisy backend evaluation applied to the IEC 60909 pandapower experiment.
 
 ## Some Required/Used Packages
 
