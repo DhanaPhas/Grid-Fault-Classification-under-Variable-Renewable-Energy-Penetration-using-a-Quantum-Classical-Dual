@@ -1,0 +1,1047 @@
+"""
+Mod_IEEE.py
+
+IEEE 38-bus, 68-bus and 123-bus pandapower network builders plus the
+fault / no-fault dataset generator used by classification algorithms pipeline.
+
+Typical use from the main pipeline:
+
+    from data.Mod_IEEE import generate_dataset, monitored_feature_columns
+
+    df = generate_dataset(N=650, vre_percent=0, random_seed=14, dataset="ieee38")
+"""
+
+import copy
+import math
+import os
+import random
+
+import numpy as np
+import pandas as pd
+import pandapower as pp
+import pandapower.shortcircuit as sc
+
+
+# =========================
+# Configuration
+# =========================
+
+# Default dataset sizes.
+NGEN_VRE0_TRAIN = 650
+NGEN_VRE0_TEST = 400
+NGEN_VRE30 = 500
+NGEN_VRE80 = 600
+
+VALID_DATASET_CHOICES = {"ieee38", "ieee68", "ieee123"}
+SELECTED_DATASET = "ieee38"
+
+N_FEATURES = 5
+DATASET_MONITORED_BUSES = {
+    "ieee38": [1, 9, 13, 20, 23, 26, 30],  # 7
+    "ieee68": [18, 26, 27, 30, 31, 36, 37, 38, 53, 54, 55, 56, 60, 61, 68],  # 15
+    "ieee123": [
+        3, 5, 10, 13, 16, 18, 21, 24, 26, 28, 30, 32,
+        38, 39, 44, 46, 48, 51, 53, 56, 59, 62, 65, 68,
+        72, 73, 78, 82, 84, 92, 103, 109, 113, 116, 119,
+    ],  # 35
+}
+FAULT_TYPES = ["3ph", "2ph", "1ph", "NF"]
+FAULT_CASES = ["max", "min"]
+
+# Cache settings. The default tag matches the original pipeline's naming
+# (with the statevector kernel) so previously cached CSVs are reused.
+CACHE_DIR = "pandapower_kernel_cache_conf_2_5"
+DEFAULT_QUANTUM_KERNEL_TAG = "FSK"
+
+# Extra cache-file suffix per network. Bump a network's entry whenever its
+# generated data changes, so stale CSVs are never silently reloaded.
+# ieee123: renewable capacity rescaled to match the 0.1 load factor (see
+# IEEE123_LOAD_FACTOR); earlier ieee123 caches had ~10x too much VRE.
+# "_rfault": fault resistance is now applied (r_fault_ohm). Earlier caches
+# were generated with every fault bolted (Rf = 0) and must not be reused.
+DATASET_CACHE_SUFFIX = {
+    "ieee38": "_rfault",
+    "ieee68": "_rfault",
+    "ieee123": "_vrefix_rfault",
+}
+
+
+def default_cache_tag(dataset=SELECTED_DATASET, quantum_kernel=DEFAULT_QUANTUM_KERNEL_TAG):
+    return "{}_{}_no_split_vre0_train650_test400_v2".format(dataset.lower(), quantum_kernel.lower())
+
+
+# =========================
+# Feature helpers
+# =========================
+
+def set_all_seeds(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+
+
+def monitored_feature_columns(include_hour=False):
+    cols = ["Ik_line_top_{}_monitored".format(i + 1) for i in range(N_FEATURES)]
+    cols += ["Ik_mean_monitored"]
+    if include_hour:
+        cols += ["hour"]
+    return cols
+
+
+def get_monitored_bus_indices(net, monitored_buses):
+    bus_indices = []
+    for bus_no in monitored_buses:
+        bus_name = "Bus {}".format(bus_no)
+        if "name" in net.bus.columns:
+            matches = net.bus.index[net.bus["name"].astype(str) == bus_name].tolist()
+        else:
+            matches = []
+
+        if matches:
+            bus_indices.extend(matches)
+        elif bus_no in net.bus.index:
+            bus_indices.append(bus_no)
+
+    return sorted(set(bus_indices))
+
+
+def extract_monitored_line_current_features(net, result_df, current_col, monitored_buses):
+    if current_col not in result_df.columns:
+        return None
+
+    monitored_bus_indices = get_monitored_bus_indices(net, monitored_buses)
+    monitored_lines = net.line.index[
+        net.line.from_bus.isin(monitored_bus_indices)
+        | net.line.to_bus.isin(monitored_bus_indices)
+    ].tolist()
+    monitored_lines = [idx for idx in monitored_lines if idx in result_df.index]
+
+    if not monitored_lines:
+        return None
+
+    measured = result_df.loc[monitored_lines, current_col].dropna().values.astype(float)
+    measured = np.sort(measured)[::-1]
+    if measured.size == 0:
+        return None
+
+    if measured.size >= N_FEATURES:
+        ik_lines = list(measured[:N_FEATURES])
+    else:
+        ik_lines = list(measured) + [0.0] * (N_FEATURES - measured.size)
+
+    features = ik_lines + [float(np.mean(measured))]
+    if np.isnan(features).any():
+        return None
+    return features
+
+
+# =========================
+# Renewable profiles
+# =========================
+
+def solar_pv_profile(hour, p_rated):
+    if hour < 6 or hour > 18:
+        return 0.0
+    mu, sigma = 12, 3
+    base_output = math.exp(-0.5 * ((hour - mu) / sigma) ** 2) * p_rated
+    cloud_factor = np.random.choice([random.uniform(0.8, 1.0), random.uniform(0.2, 0.6)], p=[0.7, 0.3])
+    return base_output * cloud_factor
+
+
+def wind_power_profile(p_rated, k=2.0, lam=8.0):
+    v = np.random.weibull(k) * lam
+    v_cut_in, v_rated, v_cut_out = 3, 12, 25
+    if v < v_cut_in or v > v_cut_out:
+        return 0.0
+    if v <= v_rated:
+        return p_rated * ((v - v_cut_in) / (v_rated - v_cut_in)) ** 3
+    return p_rated
+
+
+# =========================
+# IEEE 38-bus
+# =========================
+
+def _add_ieee38_base_elements(net, buses):
+    s_base_mva = 100.0
+    v_base_kv = 20.0
+    z_base = (v_base_kv ** 2) / s_base_mva
+
+    pp.create_ext_grid(
+        net,
+        bus=buses[1],
+        vm_pu=1.0,
+        name="Grid Bus 1",
+        s_sc_max_mva=5000.0,
+        s_sc_min_mva=4000.0,
+        rx_max=0.1,
+        rx_min=0.1,
+    )
+
+    net.ext_grid["r0x_max"] = net.ext_grid["rx_max"]
+    net.ext_grid["x0x_max"] = 1.0
+    net.ext_grid["r0x_min"] = net.ext_grid["rx_min"]
+    net.ext_grid["x0x_min"] = 1.0
+    net.ext_grid["r0x0_max"] = net.ext_grid["r0x_max"] * net.ext_grid["x0x_max"]
+    net.ext_grid["r0x0_min"] = net.ext_grid["r0x_min"] * net.ext_grid["x0x_min"]
+
+    lines_data = [
+        (1, 2, 0.000574, 0.000293, 1, 4.60),
+        (2, 3, 0.003070, 0.001564, 6, 4.10),
+        (3, 4, 0.002279, 0.001161, 11, 2.90),
+        (4, 5, 0.002373, 0.001209, 12, 2.90),
+        (5, 6, 0.005100, 0.004402, 13, 2.90),
+        (6, 7, 0.001166, 0.003853, 22, 1.50),
+        (7, 8, 0.004430, 0.001464, 23, 1.05),
+        (8, 9, 0.006413, 0.004608, 25, 1.05),
+        (9, 10, 0.006501, 0.004608, 27, 1.05),
+        (10, 11, 0.001224, 0.000405, 28, 1.05),
+        (11, 12, 0.002331, 0.000771, 29, 1.05),
+        (12, 13, 0.009141, 0.007192, 31, 0.50),
+        (13, 14, 0.003372, 0.004439, 32, 0.45),
+        (14, 15, 0.003680, 0.003275, 33, 0.30),
+        (15, 16, 0.004647, 0.003394, 34, 0.25),
+        (16, 17, 0.008026, 0.010716, 35, 0.25),
+        (17, 18, 0.004538, 0.003574, 36, 0.10),
+        (19, 2, 0.001021, 0.000974, 2, 0.50),
+        (19, 20, 0.009366, 0.008440, 3, 0.50),
+        (20, 21, 0.002550, 0.002979, 4, 0.21),
+        (21, 22, 0.004414, 0.005836, 5, 0.11),
+        (22, 37, 0.002809, 0.001920, 7, 1.05),
+        (23, 3, 0.005592, 0.004415, 8, 1.05),
+        (23, 24, 0.005592, 0.004415, 8, 1.05),
+        (24, 25, 0.005579, 0.004366, 9, 0.50),
+        (26, 6, 0.001264, 0.000644, 14, 1.50),
+        (26, 27, 0.001770, 0.000901, 15, 1.50),
+        (27, 28, 0.006594, 0.005814, 16, 1.50),
+        (28, 29, 0.005007, 0.004362, 17, 1.50),
+        (29, 30, 0.003160, 0.001610, 18, 1.50),
+        (30, 31, 0.006067, 0.005996, 19, 0.50),
+        (31, 32, 0.001933, 0.002253, 20, 0.50),
+        (32, 33, 0.002123, 0.003301, 21, 0.10),
+        (34, 29, 0.012453, 0.012453, 24, 0.50),
+        (35, 8, 0.012453, 0.012453, 26, 0.50),
+        (36, 12, 0.012453, 0.012453, 30, 0.50),
+        (38, 25, 0.003113, 0.002513, 10, 0.10),
+    ]
+
+    for f, t, r_pu, x_pu, line_no, s_l_pu in lines_data:
+        r_ohm_per_km = r_pu * z_base
+        x_ohm_per_km = x_pu * z_base
+        s_limit_mva = s_l_pu * s_base_mva
+        max_i_ka = s_limit_mva / (math.sqrt(3) * v_base_kv)
+        pp.create_line_from_parameters(
+            net,
+            from_bus=buses[f],
+            to_bus=buses[t],
+            length_km=1.0,
+            r_ohm_per_km=r_ohm_per_km,
+            x_ohm_per_km=x_ohm_per_km,
+            c_nf_per_km=0.0,
+            max_i_ka=max_i_ka,
+            name="Line {} ({}-{})".format(line_no, f, t),
+        )
+
+    bus_loads_pu = {
+        4: (0.5, 0.18),
+        7: (0.23, 0.08),
+        8: (0.52, 0.17),
+        12: (0.09, 0.03),
+        15: (0.32, 0.15),
+        16: (0.33, 0.03),
+        18: (0.16, 0.03),
+        20: (0.68, 0.10),
+        21: (0.27, 0.11),
+        23: (0.25, 0.08),
+        24: (0.31, -0.09),
+        25: (0.22, 0.05),
+        26: (0.14, 0.02),
+        27: (0.28, 0.07),
+        29: (0.28, 0.03),
+        31: (0.01, 0.005),
+        38: (0.16, 0.02),
+    }
+
+    for bus_no, (p_pu, q_pu) in bus_loads_pu.items():
+        pp.create_load(
+            net,
+            bus=buses[bus_no],
+            p_mw=p_pu * s_base_mva,
+            q_mvar=q_pu * s_base_mva,
+            name="Load_bus_{}".format(bus_no),
+        )
+
+    net.line["r0_ohm_per_km"] = 0.244
+    net.line["x0_ohm_per_km"] = 0.336
+    net.line["c0_nf_per_km"] = 2000
+    net.line["endtemp_degree"] = 80.0
+
+
+def build_ieee38_net(vre_percent=0, dynamic_profile=True, hours=24, seed=42):
+    set_all_seeds(seed)
+
+    net = pp.create_empty_network()
+    buses = {}
+    for i in range(1, 39):
+        buses[i] = pp.create_bus(net, vn_kv=20.0, name="Bus {}".format(i))
+
+    _add_ieee38_base_elements(net, buses)
+
+    pv_sgen_indices = {}
+    wind_sgen_indices = {}
+    profiles = None
+
+    if vre_percent > 0:
+        if int(vre_percent) == 80:
+            pv_data_base = {
+                5: 10.70,
+                7: 13.38,
+                10: 5.35,
+                13: 8.03,
+                15: 16.06,
+                16: 10.70,
+                18: 13.38,
+                19: 21.41,
+                20: 16.06,
+                23: 5.35,
+                25: 18.73,
+                27: 13.38,
+                33: 5.35,
+                34: 10.70,
+                38: 13.38,
+            }
+            wind_data_base = {
+                6: 13.38,
+                8: 10.70,
+                9: 18.73,
+                11: 5.35,
+                14: 16.06,
+                17: 10.70,
+                21: 10.70,
+                22: 13.38,
+                24: 21.41,
+                28: 16.06,
+                30: 10.70,
+                32: 8.03,
+                34: 13.38,
+                35: 16.06,
+                36: 5.35,
+                37: 8.03,
+            }
+            total_load_mw = float(net.load["p_mw"].sum())
+            target_re_capacity_mw = total_load_mw * 0.80
+            base_re_capacity_mw = sum(pv_data_base.values()) + sum(wind_data_base.values())
+            scale = target_re_capacity_mw / base_re_capacity_mw if base_re_capacity_mw else 0.0
+            print("VRE80 target RE capacity: {:.2f} MW; base RE capacity: {:.2f} MW; scale: {:.4f}".format(
+                target_re_capacity_mw,
+                base_re_capacity_mw,
+                scale,
+            ))
+            pv_data = {bus: p_mw * scale for bus, p_mw in pv_data_base.items()}
+            wind_data = {bus: p_mw * scale for bus, p_mw in wind_data_base.items()}
+        else:
+            # The first uploaded renewable ratings are treated as the 30% VRE case.
+            # Other nonzero VRE values scale this same placement proportionally.
+            vre_scale = float(vre_percent) / 30.0
+            pv_data = {5: 10.36, 13: 7.77, 20: 15.55, 27: 12.95, 33: 5.18, 34: 10.36, 38: 12.95}
+            wind_data = {9: 18.14, 17: 10.36, 24: 20.73, 30: 10.36, 37: 7.77}
+            pv_data = {bus: p_mw * vre_scale for bus, p_mw in pv_data.items()}
+            wind_data = {bus: p_mw * vre_scale for bus, p_mw in wind_data.items()}
+
+        for bus_num, p_scaled in pv_data.items():
+            idx = pp.create_sgen(
+                net,
+                bus=buses[bus_num],
+                p_mw=p_scaled,
+                q_mvar=0.0,
+                sn_mva=max(p_scaled, 1e-6),
+                k=1.2,
+                name="PV_{:.2f}MW_Bus{}".format(p_scaled, bus_num),
+            )
+            pv_sgen_indices[idx] = p_scaled
+
+        for bus_num, p_scaled in wind_data.items():
+            idx = pp.create_sgen(
+                net,
+                bus=buses[bus_num],
+                p_mw=p_scaled,
+                q_mvar=0.1 * p_scaled,
+                sn_mva=max(p_scaled, 1e-6),
+                k=1.2,
+                name="Wind_{:.2f}MW_Bus{}".format(p_scaled, bus_num),
+            )
+            wind_sgen_indices[idx] = p_scaled
+
+    if vre_percent > 0 and dynamic_profile:
+        profile_data = {}
+        for hour in range(hours):
+            hourly_values = {}
+            for sgen_idx, p_rated in pv_sgen_indices.items():
+                hourly_values[sgen_idx] = solar_pv_profile(hour, p_rated)
+            for sgen_idx, p_rated in wind_sgen_indices.items():
+                hourly_values[sgen_idx] = wind_power_profile(p_rated)
+            profile_data[hour] = hourly_values
+
+        profiles = pd.DataFrame.from_dict(profile_data, orient="index")
+        if 0 in profiles.index:
+            for sgen_idx in profiles.columns:
+                p_val = profiles.loc[0, sgen_idx]
+                net.sgen.at[sgen_idx, "p_mw"] = p_val
+                if "Wind" in str(net.sgen.at[sgen_idx, "name"]):
+                    net.sgen.at[sgen_idx, "q_mvar"] = 0.1 * p_val
+
+    fault_buses = net.bus.index.tolist()
+    return net, fault_buses, net.line.index.tolist(), net.load.index.tolist(), profiles
+
+
+# =========================
+# IEEE 68-bus
+# =========================
+
+IEEE68_LINES_DATA = [
+    (1, 54, 0.0068, 0.0082, 1, 2.5), (2, 58, 0.0051, 0.0075, 2, 3.1),
+    (3, 62, 0.0110, 0.0120, 3, 4.5), (4, 19, 0.0025, 0.0035, 4, 1.8),
+    (5, 20, 0.0080, 0.0090, 5, 2.2), (6, 22, 0.0045, 0.0055, 6, 1.5),
+    (7, 23, 0.0095, 0.0105, 7, 2.0), (8, 25, 0.0070, 0.0080, 8, 2.8),
+    (9, 29, 0.0030, 0.0040, 9, 1.2), (10, 31, 0.0125, 0.0145, 10, 4.8),
+    (11, 32, 0.0015, 0.0025, 11, 0.9), (12, 36, 0.0060, 0.0070, 12, 2.6),
+    (13, 17, 0.0085, 0.0095, 13, 3.0), (14, 41, 0.0100, 0.0110, 14, 3.5),
+    (15, 42, 0.0055, 0.0065, 15, 2.3), (16, 18, 0.0035, 0.0045, 16, 1.7),
+    (17, 36, 0.0075, 0.0085, 17, 2.9), (17, 43, 0.0090, 0.0100, 18, 3.3),
+    (18, 42, 0.0115, 0.0135, 19, 4.0), (18, 49, 0.0020, 0.0030, 20, 1.1),
+    (18, 50, 0.0065, 0.0075, 21, 2.7), (19, 20, 0.0040, 0.0050, 22, 1.9),
+    (19, 68, 0.0105, 0.0115, 23, 3.8), (21, 22, 0.0080, 0.0090, 24, 3.2),
+    (21, 68, 0.0050, 0.0060, 25, 2.1), (22, 23, 0.0070, 0.0080, 26, 2.8),
+    (23, 24, 0.0090, 0.0100, 27, 3.4), (24, 68, 0.0060, 0.0070, 28, 2.4),
+    (25, 26, 0.0030, 0.0040, 29, 1.3), (25, 54, 0.0120, 0.0140, 30, 4.7),
+    (26, 27, 0.0010, 0.0020, 31, 0.8), (26, 28, 0.0055, 0.0065, 32, 2.3),
+    (26, 29, 0.0085, 0.0095, 33, 3.1), (27, 53, 0.0100, 0.0110, 34, 3.6),
+    (27, 37, 0.0045, 0.0055, 35, 1.6), (28, 29, 0.0075, 0.0085, 36, 2.9),
+    (30, 31, 0.0025, 0.0035, 37, 1.0), (30, 53, 0.0115, 0.0135, 38, 4.2),
+    (30, 61, 0.0095, 0.0105, 39, 3.7), (31, 38, 0.0065, 0.0075, 40, 2.7),
+    (31, 53, 0.0040, 0.0050, 41, 1.9), (32, 33, 0.0080, 0.0090, 42, 3.2),
+    (33, 34, 0.0050, 0.0060, 43, 2.1), (33, 38, 0.0070, 0.0080, 44, 2.8),
+    (34, 35, 0.0105, 0.0115, 45, 3.8), (34, 36, 0.0035, 0.0045, 46, 1.4),
+    (35, 45, 0.0125, 0.0145, 47, 4.9), (36, 61, 0.0015, 0.0025, 48, 0.9),
+    (37, 52, 0.0060, 0.0070, 49, 2.6), (37, 68, 0.0090, 0.0100, 50, 3.3),
+    (38, 46, 0.0110, 0.0120, 51, 4.5), (39, 44, 0.0020, 0.0030, 52, 1.1),
+    (39, 45, 0.0055, 0.0065, 53, 2.3), (40, 41, 0.0085, 0.0095, 54, 3.1),
+    (41, 42, 0.0085, 0.0095, 54, 3.1), (40, 48, 0.0100, 0.0110, 55, 3.5),
+    (43, 44, 0.0045, 0.0055, 56, 1.8), (44, 45, 0.0075, 0.0085, 57, 2.9),
+    (46, 49, 0.0025, 0.0035, 58, 1.2), (47, 48, 0.0115, 0.0135, 59, 4.1),
+    (50, 51, 0.0095, 0.0105, 60, 3.6), (47, 53, 0.0115, 0.0135, 59, 4.1),
+    (52, 55, 0.0065, 0.0075, 61, 2.7), (53, 54, 0.0030, 0.0040, 62, 1.3),
+    (54, 55, 0.0080, 0.0090, 63, 3.2), (55, 56, 0.0050, 0.0060, 64, 2.1),
+    (56, 57, 0.0070, 0.0080, 65, 2.8), (56, 66, 0.0105, 0.0115, 66, 3.8),
+    (57, 60, 0.0035, 0.0045, 67, 1.7), (58, 59, 0.0125, 0.0145, 68, 4.9),
+    (58, 64, 0.0015, 0.0025, 69, 0.9), (59, 60, 0.0060, 0.0070, 70, 2.6),
+    (60, 61, 0.0090, 0.0100, 71, 3.3), (62, 63, 0.0110, 0.0120, 72, 4.5),
+    (62, 65, 0.0020, 0.0030, 73, 1.1), (63, 64, 0.0055, 0.0065, 74, 2.3),
+    (64, 65, 0.0085, 0.0095, 75, 3.1), (65, 66, 0.0100, 0.0110, 76, 3.5),
+    (66, 67, 0.0045, 0.0055, 77, 1.8), (67, 68, 0.0075, 0.0085, 78, 2.9),
+]
+
+
+IEEE68_LOADS_PU = {
+    17: (0.45, 0.15), 18: (0.33, -0.05), 20: (0.65, 0.18), 21: (0.22, 0.08),
+    23: (0.50, 0.12), 24: (0.39, -0.02), 25: (0.28, 0.11), 26: (0.15, 0.04),
+    27: (0.48, 0.19), 28: (0.55, 0.14), 29: (0.31, 0.07), 33: (0.42, 0.09),
+    36: (0.68, 0.20), 39: (0.25, -0.08), 40: (0.35, 0.13), 41: (0.18, 0.03),
+    42: (0.40, 0.16), 44: (0.20, 0.06), 45: (0.60, -0.01), 46: (0.12, 0.01),
+    47: (0.58, 0.17), 48: (0.30, 0.10), 49: (0.24, -0.04), 50: (0.49, 0.05),
+    51: (0.37, 0.11), 52: (0.13, 0.02), 53: (0.53, 0.18), 55: (0.29, 0.08),
+    56: (0.44, -0.03), 59: (0.62, 0.14), 60: (0.21, 0.09), 61: (0.47, 0.12),
+    64: (0.34, 0.07), 67: (0.51, 0.15), 68: (0.19, -0.06),
+}
+
+
+IEEE68_VRE30_PV_DATA = {
+    5: 12.81, 15: 15.37, 28: 9.22, 43: 17.93, 57: 11.27, 66: 20.50,
+    4: 10.25, 8: 7.69, 12: 15.37, 16: 12.81, 30: 15.37, 38: 10.25, 50: 9.22,
+}
+
+
+IEEE68_VRE30_WIND_DATA = {
+    10: 23.06, 24: 16.40, 35: 25.62, 51: 14.35, 63: 21.01, 2: 17.93,
+    7: 20.50, 20: 15.37, 32: 25.62, 40: 12.81, 47: 15.37, 60: 20.50,
+}
+
+
+IEEE68_VRE80_PV_DATA = {
+    5: 15.17, 15: 18.20, 28: 10.92, 43: 21.24, 57: 13.35, 66: 24.27,
+    4: 12.14, 8: 9.10, 12: 18.20, 16: 15.17, 30: 18.20, 38: 12.14,
+    50: 10.92, 3: 12.14, 6: 13.35, 9: 9.10, 11: 18.20, 13: 15.17,
+    14: 21.24, 17: 12.14, 18: 10.92, 19: 15.17, 21: 18.20, 22: 13.35,
+    23: 9.10, 25: 18.20, 26: 12.14, 27: 16.99, 29: 11.53,
+}
+
+
+IEEE68_VRE80_WIND_DATA = {
+    10: 27.30, 24: 19.42, 35: 30.34, 51: 16.99, 63: 24.88, 2: 21.24,
+    7: 24.27, 20: 18.20, 32: 30.34, 40: 15.17, 47: 18.20, 60: 24.27,
+    31: 24.27, 33: 21.24, 34: 30.34, 36: 18.20, 37: 16.99, 39: 25.48,
+    41: 20.02, 42: 24.27, 44: 22.45, 45: 30.34, 46: 15.17, 48: 18.20,
+    49: 24.27, 52: 19.42, 53: 27.30, 54: 23.06,
+}
+
+
+def _add_ieee68_base_elements(net, buses):
+    s_base_mva = 100.0
+    v_base_kv = 20.0
+    z_base = (v_base_kv ** 2) / s_base_mva
+
+    pp.create_ext_grid(
+        net,
+        bus=buses[1],
+        vm_pu=1.0,
+        name="Grid Bus 1",
+        s_sc_max_mva=5000.0,
+        s_sc_min_mva=4000.0,
+        rx_max=0.1,
+        rx_min=0.1,
+    )
+
+    net.ext_grid["r0x_max"] = net.ext_grid["rx_max"]
+    net.ext_grid["x0x_max"] = 1.0
+    net.ext_grid["r0x_min"] = net.ext_grid["rx_min"]
+    net.ext_grid["x0x_min"] = 1.0
+    net.ext_grid["r0x0_max"] = net.ext_grid["r0x_max"] * net.ext_grid["x0x_max"]
+    net.ext_grid["r0x0_min"] = net.ext_grid["r0x_min"] * net.ext_grid["x0x_min"]
+
+    for f, t, r_pu, x_pu, line_no, s_l_pu in IEEE68_LINES_DATA:
+        r_ohm_per_km = r_pu * z_base
+        x_ohm_per_km = x_pu * z_base
+        s_limit_mva = s_l_pu * s_base_mva
+        max_i_ka = s_limit_mva / (math.sqrt(3) * v_base_kv)
+        pp.create_line_from_parameters(
+            net,
+            from_bus=buses[f],
+            to_bus=buses[t],
+            length_km=1.0,
+            r_ohm_per_km=r_ohm_per_km,
+            x_ohm_per_km=x_ohm_per_km,
+            c_nf_per_km=0.0,
+            max_i_ka=max_i_ka,
+            name="Line {} ({}-{})".format(line_no, f, t),
+        )
+
+    for bus_no, (p_pu, q_pu) in IEEE68_LOADS_PU.items():
+        pp.create_load(
+            net,
+            bus=buses[bus_no],
+            p_mw=p_pu * s_base_mva,
+            q_mvar=q_pu * s_base_mva,
+            name="Load_bus_{}".format(bus_no),
+        )
+
+    net.line["r0_ohm_per_km"] = 0.244
+    net.line["x0_ohm_per_km"] = 0.336
+    net.line["c0_nf_per_km"] = 2000
+    net.line["endtemp_degree"] = 80.0
+
+
+def build_ieee68_net(vre_percent=0, dynamic_profile=True, hours=24, seed=42):
+    set_all_seeds(seed)
+
+    net = pp.create_empty_network()
+    buses = {}
+    for i in range(1, 69):
+        buses[i] = pp.create_bus(net, vn_kv=20.0, name="Bus {}".format(i))
+
+    _add_ieee68_base_elements(net, buses)
+
+    pv_sgen_indices = {}
+    wind_sgen_indices = {}
+    profiles = None
+
+    if vre_percent > 0:
+        if int(vre_percent) == 80:
+            pv_data = IEEE68_VRE80_PV_DATA
+            wind_data = IEEE68_VRE80_WIND_DATA
+        elif int(vre_percent) == 30:
+            pv_data = IEEE68_VRE30_PV_DATA
+            wind_data = IEEE68_VRE30_WIND_DATA
+        else:
+            scale = float(vre_percent) / 30.0
+            pv_data = {bus: p_mw * scale for bus, p_mw in IEEE68_VRE30_PV_DATA.items()}
+            wind_data = {bus: p_mw * scale for bus, p_mw in IEEE68_VRE30_WIND_DATA.items()}
+
+        for bus_num, p_scaled in pv_data.items():
+            idx = pp.create_sgen(
+                net,
+                bus=buses[bus_num],
+                p_mw=p_scaled,
+                q_mvar=0.0,
+                sn_mva=max(p_scaled, 1e-6),
+                k=1.2,
+                name="PV_{:.2f}MW_Bus{}".format(p_scaled, bus_num),
+            )
+            pv_sgen_indices[idx] = p_scaled
+
+        for bus_num, p_scaled in wind_data.items():
+            idx = pp.create_sgen(
+                net,
+                bus=buses[bus_num],
+                p_mw=p_scaled,
+                q_mvar=0.1 * p_scaled,
+                sn_mva=max(p_scaled, 1e-6),
+                k=1.2,
+                name="Wind_{:.2f}MW_Bus{}".format(p_scaled, bus_num),
+            )
+            wind_sgen_indices[idx] = p_scaled
+
+    if vre_percent > 0 and dynamic_profile:
+        profile_data = {}
+        for hour in range(hours):
+            hourly_values = {}
+            for sgen_idx, p_rated in pv_sgen_indices.items():
+                hourly_values[sgen_idx] = solar_pv_profile(hour, p_rated)
+            for sgen_idx, p_rated in wind_sgen_indices.items():
+                hourly_values[sgen_idx] = wind_power_profile(p_rated)
+            profile_data[hour] = hourly_values
+
+        profiles = pd.DataFrame.from_dict(profile_data, orient="index")
+        if 0 in profiles.index:
+            for sgen_idx in profiles.columns:
+                p_val = profiles.loc[0, sgen_idx]
+                net.sgen.at[sgen_idx, "p_mw"] = p_val
+                if sgen_idx in wind_sgen_indices:
+                    net.sgen.at[sgen_idx, "q_mvar"] = 0.1 * p_val
+                else:
+                    net.sgen.at[sgen_idx, "q_mvar"] = 0.0
+
+    fault_buses = net.bus.index.tolist()
+    return net, fault_buses, net.line.index.tolist(), net.load.index.tolist(), profiles
+
+
+# =========================
+# IEEE 123-bus
+# =========================
+
+IEEE123_LINES_DATA = [
+    (1, 2, 0.0084, 0.002, 1, 3.4), (2, 3, 0.003, 0.002, 2, 1.4),
+    (3, 4, 0.0097, 0.0101, 3, 3.7), (3, 5, 0.0122, 0.0068, 4, 2.9),
+    (5, 6, 0.0054, 0.0028, 5, 2.8), (5, 7, 0.0069, 0.0125, 6, 2.5),
+    (7, 8, 0.0025, 0.0019, 7, 0.7), (3, 9, 0.0126, 0.0069, 8, 4.0),
+    (9, 10, 0.0067, 0.0014, 9, 2.6), (10, 11, 0.0034, 0.013, 10, 4.2),
+    (10, 12, 0.0128, 0.0076, 11, 4.4), (12, 13, 0.0128, 0.0076, 11, 4.4),
+    (13, 14, 0.0091, 0.0142, 12, 3.2), (13, 15, 0.0059, 0.0026, 13, 1.1),
+    (10, 16, 0.0101, 0.0041, 14, 2.5), (16, 17, 0.0093, 0.0095, 15, 3.5),
+    (17, 18, 0.0071, 0.0147, 16, 3.8), (18, 19, 0.0104, 0.0133, 17, 4.9),
+    (18, 20, 0.0071, 0.005, 18, 4.9), (16, 21, 0.0065, 0.0116, 19, 2.7),
+    (21, 22, 0.0049, 0.0075, 20, 2.7), (22, 23, 0.0079, 0.0025, 21, 1.5),
+    (21, 38, 0.0078, 0.003, 22, 4.9), (25, 24, 0.0078, 0.003, 22, 4.9),
+    (21, 24, 0.0085, 0.005, 23, 1.3), (24, 26, 0.0063, 0.0143, 24, 4.5),
+    (26, 27, 0.011, 0.0028, 26, 4.8), (26, 28, 0.0044, 0.0011, 27, 3.2),
+    (28, 29, 0.0069, 0.0082, 28, 2.8), (29, 30, 0.0062, 0.0145, 29, 3.9),
+    (30, 31, 0.0113, 0.0053, 30, 1.3), (29, 32, 0.0067, 0.0039, 31, 4.8),
+    (32, 33, 0.0102, 0.0149, 32, 2.2), (28, 34, 0.0116, 0.003, 33, 0.6),
+    (34, 35, 0.0062, 0.0131, 34, 0.4), (35, 36, 0.0046, 0.0084, 35, 3.7),
+    (36, 37, 0.0112, 0.0091, 36, 2.0), (38, 39, 0.0116, 0.0043, 37, 4.8),
+    (39, 40, 0.0123, 0.0068, 38, 3.0), (40, 41, 0.0024, 0.0097, 39, 0.6),
+    (40, 42, 0.0059, 0.0056, 40, 0.4), (42, 43, 0.0125, 0.0101, 41, 0.6),
+    (39, 44, 0.0123, 0.0103, 42, 0.3), (44, 45, 0.0039, 0.009, 43, 0.7),
+    (44, 46, 0.0092, 0.0019, 44, 0.9), (46, 47, 0.0076, 0.0026, 45, 3.7),
+    (46, 48, 0.0096, 0.0013, 46, 1.8), (48, 49, 0.0021, 0.0098, 47, 2.2),
+    (49, 50, 0.0099, 0.0149, 48, 1.3), (48, 51, 0.0102, 0.0125, 49, 2.1),
+    (51, 52, 0.0067, 0.0122, 50, 2.4), (51, 53, 0.0031, 0.0087, 51, 0.9),
+    (53, 54, 0.0018, 0.0124, 52, 2.4), (54, 55, 0.0121, 0.0105, 53, 0.9),
+    (16, 56, 0.0086, 0.0052, 54, 0.9), (56, 57, 0.0106, 0.0112, 55, 2.3),
+    (57, 58, 0.0129, 0.0096, 56, 1.7), (58, 59, 0.011, 0.0055, 57, 2.6),
+    (59, 60, 0.002, 0.0146, 58, 1.0), (60, 61, 0.0028, 0.0026, 59, 2.6),
+    (59, 62, 0.0078, 0.0016, 60, 3.2), (62, 63, 0.0074, 0.0049, 61, 4.3),
+    (63, 64, 0.0102, 0.0014, 62, 2.2), (62, 65, 0.0016, 0.0081, 63, 3.8),
+    (65, 66, 0.0056, 0.0014, 64, 4.8), (65, 67, 0.0071, 0.0124, 65, 0.5),
+    (67, 68, 0.0117, 0.008, 66, 4.3), (68, 69, 0.0055, 0.0052, 67, 4.6),
+    (69, 70, 0.0041, 0.0034, 68, 4.9), (70, 71, 0.0029, 0.0148, 69, 4.3),
+    (65, 72, 0.007, 0.0041, 70, 0.7), (72, 73, 0.0017, 0.0142, 71, 3.7),
+    (73, 74, 0.0035, 0.0139, 72, 4.6), (74, 75, 0.0094, 0.0118, 73, 4.2),
+    (75, 76, 0.0059, 0.0023, 74, 4.9), (76, 77, 0.0012, 0.003, 75, 1.6),
+    (117, 116, 0.0109, 0.0064, 76, 4.1), (116, 118, 0.0028, 0.0069, 77, 3.8),
+    (120, 119, 0.0022, 0.013, 78, 4.7), (119, 121, 0.0066, 0.0097, 79, 1.4),
+    (121, 122, 0.012, 0.0149, 80, 2.1), (122, 123, 0.0021, 0.0017, 81, 2.7),
+    (119, 118, 0.0038, 0.0108, 82, 1.3), (116, 113, 0.0106, 0.0027, 83, 4.8),
+    (113, 114, 0.0072, 0.0125, 84, 3.8), (114, 115, 0.0121, 0.0084, 85, 1.2),
+    (113, 109, 0.0029, 0.008, 86, 0.5), (109, 110, 0.0082, 0.0061, 87, 0.3),
+    (110, 111, 0.011, 0.0055, 88, 4.2), (111, 112, 0.0117, 0.0125, 89, 2.4),
+    (109, 108, 0.0101, 0.0128, 90, 1.0), (108, 103, 0.0087, 0.0135, 91, 0.6),
+    (103, 104, 0.0102, 0.008, 92, 4.3), (104, 105, 0.0027, 0.014, 93, 3.0),
+    (105, 106, 0.0127, 0.0118, 94, 4.8), (106, 107, 0.007, 0.0123, 95, 1.3),
+    (103, 73, 0.0127, 0.0118, 114, 4.8), (73, 78, 0.0068, 0.0076, 96, 0.5),
+    (78, 79, 0.0072, 0.0095, 97, 4.0), (79, 80, 0.0014, 0.0117, 98, 2.2),
+    (80, 81, 0.0046, 0.0092, 99, 4.8), (78, 82, 0.0116, 0.0041, 100, 4.6),
+    (82, 83, 0.0114, 0.007, 101, 3.9), (83, 84, 0.0031, 0.0106, 102, 0.7),
+    (84, 85, 0.0092, 0.0101, 103, 1.0), (84, 86, 0.0031, 0.0106, 116, 0.7),
+    (89, 88, 0.0109, 0.0092, 105, 0.4), (86, 87, 0.0081, 0.0037, 106, 1.3),
+    (87, 90, 0.0042, 0.0056, 107, 4.9), (91, 90, 0.0033, 0.0091, 108, 0.2),
+    (88, 87, 0.0109, 0.0092, 105, 0.4), (82, 92, 0.0033, 0.0091, 115, 0.2),
+    (92, 93, 0.0033, 0.0091, 117, 0.2), (93, 94, 0.005, 0.005, 118, 1.0),
+    (93, 95, 0.005, 0.005, 119, 1.0), (95, 96, 0.005, 0.005, 120, 1.0),
+    (95, 97, 0.005, 0.005, 121, 1.0), (97, 98, 0.005, 0.005, 122, 1.0),
+    (97, 99, 0.005, 0.005, 123, 1.0), (99, 100, 0.005, 0.005, 124, 1.0),
+    (99, 101, 0.005, 0.005, 125, 1.0), (101, 102, 0.005, 0.005, 126, 1.0),
+]
+
+
+IEEE123_LOADS_PU = {
+    2: (0.1, -0.01), 3: (0.54, 0.17), 4: (0.43, -0.06), 6: (0.6, 0.02),
+    8: (0.29, -0.06), 11: (0.51, 0.04), 13: (0.1, 0.05), 14: (0.33, 0.13),
+    16: (0.24, 0.05), 18: (0.42, 0.04), 19: (0.34, 0.04), 20: (0.32, 0.06),
+    21: (0.66, 0.1), 23: (0.19, 0.08), 26: (0.32, 0.19), 29: (0.43, 0.13),
+    31: (0.45, 0.07), 33: (0.68, 0.01), 34: (0.63, 0.03), 36: (0.52, 0.16),
+    39: (0.54, 0.14), 40: (0.21, 0.02), 43: (0.57, -0.0), 45: (0.39, 0.1),
+    46: (0.67, 0.04), 48: (0.58, 0.04), 50: (0.4, 0.13), 51: (0.58, -0.09),
+    52: (0.58, -0.06), 53: (0.29, -0.1), 54: (0.44, 0.09), 56: (0.4, 0.08),
+    57: (0.2, 0.16), 59: (0.56, -0.06), 62: (0.22, 0.03), 63: (0.2, 0.04),
+    64: (0.23, -0.02), 65: (0.17, -0.07), 67: (0.42, 0.17), 68: (0.58, 0.04),
+    69: (0.35, 0.08), 70: (0.33, -0.04), 71: (0.63, 0.19), 74: (0.46, -0.1),
+    77: (0.39, 0.14), 78: (0.15, -0.02), 80: (0.62, 0.08), 81: (0.62, -0.03),
+    83: (0.22, 0.15), 84: (0.26, 0.19), 86: (0.26, 0.12), 92: (0.68, 0.05),
+    95: (0.65, 0.12), 98: (0.66, -0.03), 101: (0.62, 0.05), 102: (0.36, -0.09),
+    104: (0.57, 0.01), 106: (0.48, 0.15), 110: (0.31, 0.16), 112: (0.4, 0.01),
+}
+
+
+# Loads (and therefore renewable capacity) are scaled by this factor so the
+# 123-bus system stays within a realistic 20 kV operating range.
+IEEE123_LOAD_FACTOR = 0.1
+
+# The VRE tables below are sized against the UNSCALED load (~2535 MW), so
+# build_ieee123_net multiplies them by IEEE123_LOAD_FACTOR to keep installed
+# capacity at 30% / 80% of the actual (scaled) load.
+IEEE123_VRE30_PV_DATA = {
+    5: 14.75, 9: 14.04, 12: 10.53, 15: 23.88, 17: 15.45, 22: 21.07,
+    25: 12.64, 28: 7.72, 30: 17.56, 32: 21.77, 37: 13.34, 38: 14.04,
+    41: 16.15, 43: 21.07, 57: 18.26, 66: 27.39, 76: 12.64, 88: 15.45,
+    97: 10.53, 108: 19.66,
+}
+
+
+IEEE123_VRE30_WIND_DATA = {
+    10: 30.90, 24: 21.77, 27: 21.07, 35: 33.71, 44: 17.56, 47: 23.17,
+    49: 28.09, 51: 18.96, 55: 19.66, 58: 24.58, 60: 28.79, 63: 28.09,
+    72: 20.36, 73: 21.07, 75: 26.68, 82: 13.34, 94: 23.17, 113: 31.60,
+}
+
+
+IEEE123_VRE80_PV_DATA = {
+    2: 16.34, 3: 12.26, 4: 17.98, 5: 17.16, 6: 24.51, 7: 14.71,
+    8: 20.43, 9: 16.34, 11: 25.33, 12: 12.26, 13: 15.52, 14: 16.34,
+    15: 27.78, 16: 18.79, 17: 17.98, 18: 22.88, 19: 13.89, 20: 24.51,
+    21: 20.43, 22: 24.51, 23: 17.98, 25: 14.71, 26: 15.52, 28: 8.99,
+    29: 21.24, 30: 20.43, 31: 24.51, 32: 25.33, 33: 19.61, 34: 14.71,
+    36: 20.43, 37: 15.52, 38: 16.34, 39: 24.51, 40: 17.16, 41: 18.79,
+    42: 15.52, 43: 24.51, 57: 21.24, 66: 31.87, 76: 14.71, 88: 17.98,
+    97: 12.26, 108: 22.88,
+}
+
+
+IEEE123_VRE80_WIND_DATA = {
+    10: 35.95, 24: 25.33, 27: 24.51, 35: 39.22, 44: 20.43, 45: 24.51,
+    46: 20.43, 47: 26.96, 48: 26.96, 49: 32.68, 50: 32.68, 51: 22.06,
+    52: 22.88, 53: 28.60, 54: 33.50, 55: 22.88, 56: 23.70, 58: 28.60,
+    59: 24.51, 60: 33.50, 61: 31.05, 62: 32.68, 63: 32.68, 64: 25.33,
+    65: 22.06, 67: 36.77, 68: 31.87, 69: 22.88, 70: 29.41, 71: 32.68,
+    72: 23.70, 73: 24.51, 74: 26.15, 75: 31.05, 77: 23.70, 78: 28.60,
+    79: 32.68, 80: 26.96, 81: 22.88, 82: 15.52, 83: 24.51, 94: 26.96,
+    113: 36.77,
+}
+
+
+def _add_ieee123_base_elements(net, buses):
+    s_base_mva = 100.0
+    v_base_kv = 20.0
+    z_base = (v_base_kv ** 2) / s_base_mva
+    load_factor = IEEE123_LOAD_FACTOR
+
+    pp.create_ext_grid(
+        net,
+        bus=buses[1],
+        vm_pu=1.0,
+        name="Grid Bus 1",
+        s_sc_max_mva=5000.0,
+        s_sc_min_mva=4000.0,
+        rx_max=0.1,
+        rx_min=0.1,
+    )
+
+    net.ext_grid["r0x_max"] = net.ext_grid["rx_max"]
+    net.ext_grid["x0x_max"] = 1.0
+    net.ext_grid["r0x_min"] = net.ext_grid["rx_min"]
+    net.ext_grid["x0x_min"] = 1.0
+    net.ext_grid["r0x0_max"] = net.ext_grid["r0x_max"] * net.ext_grid["x0x_max"]
+    net.ext_grid["r0x0_min"] = net.ext_grid["r0x_min"] * net.ext_grid["x0x_min"]
+
+    for f, t, r_pu, x_pu, line_no, s_l_pu in IEEE123_LINES_DATA:
+        r_ohm_per_km = r_pu * z_base
+        x_ohm_per_km = x_pu * z_base
+        s_limit_mva = s_l_pu * s_base_mva
+        max_i_ka = s_limit_mva / (math.sqrt(3) * v_base_kv)
+        pp.create_line_from_parameters(
+            net,
+            from_bus=buses[f],
+            to_bus=buses[t],
+            length_km=1.0,
+            r_ohm_per_km=r_ohm_per_km,
+            x_ohm_per_km=x_ohm_per_km,
+            c_nf_per_km=0.0005,
+            max_i_ka=max_i_ka,
+            name="Line {} ({}-{})".format(line_no, f, t),
+        )
+
+    for bus_no, (p_pu, q_pu) in IEEE123_LOADS_PU.items():
+        pp.create_load(
+            net,
+            bus=buses[bus_no],
+            p_mw=p_pu * s_base_mva * load_factor,
+            q_mvar=q_pu * s_base_mva * load_factor,
+            name="Load_bus_{}".format(bus_no),
+        )
+
+    net.line["r0_ohm_per_km"] = 0.244
+    net.line["x0_ohm_per_km"] = 0.336
+    net.line["c0_nf_per_km"] = 2000
+    net.line["endtemp_degree"] = 80.0
+
+
+def build_ieee123_net(vre_percent=0, dynamic_profile=True, hours=24, seed=42):
+    set_all_seeds(seed)
+
+    net = pp.create_empty_network()
+    buses = {}
+    for i in range(1, 124):
+        buses[i] = pp.create_bus(net, vn_kv=20.0, name="Bus {}".format(i))
+
+    _add_ieee123_base_elements(net, buses)
+
+    pv_sgen_indices = {}
+    wind_sgen_indices = {}
+    profiles = None
+
+    if vre_percent > 0:
+        if int(vre_percent) == 80:
+            pv_data = IEEE123_VRE80_PV_DATA
+            wind_data = IEEE123_VRE80_WIND_DATA
+        elif int(vre_percent) == 30:
+            pv_data = IEEE123_VRE30_PV_DATA
+            wind_data = IEEE123_VRE30_WIND_DATA
+        else:
+            scale = float(vre_percent) / 30.0
+            pv_data = {bus: p_mw * scale for bus, p_mw in IEEE123_VRE30_PV_DATA.items()}
+            wind_data = {bus: p_mw * scale for bus, p_mw in IEEE123_VRE30_WIND_DATA.items()}
+
+        # Match renewable capacity to the scaled load (see IEEE123_LOAD_FACTOR).
+        pv_data = {bus: p_mw * IEEE123_LOAD_FACTOR for bus, p_mw in pv_data.items()}
+        wind_data = {bus: p_mw * IEEE123_LOAD_FACTOR for bus, p_mw in wind_data.items()}
+
+        for bus_num, p_scaled in pv_data.items():
+            idx = pp.create_sgen(
+                net,
+                bus=buses[bus_num],
+                p_mw=p_scaled,
+                q_mvar=0.0,
+                sn_mva=max(p_scaled, 1e-6),
+                k=1.2,
+                name="PV_{:.2f}MW_Bus{}".format(p_scaled, bus_num),
+            )
+            pv_sgen_indices[idx] = p_scaled
+
+        for bus_num, p_scaled in wind_data.items():
+            idx = pp.create_sgen(
+                net,
+                bus=buses[bus_num],
+                p_mw=p_scaled,
+                q_mvar=0.1 * p_scaled,
+                sn_mva=max(p_scaled, 1e-6),
+                k=1.2,
+                name="Wind_{:.2f}MW_Bus{}".format(p_scaled, bus_num),
+            )
+            wind_sgen_indices[idx] = p_scaled
+
+    if vre_percent > 0 and dynamic_profile:
+        profile_data = {}
+        for hour in range(hours):
+            hourly_values = {}
+            for sgen_idx, p_rated in pv_sgen_indices.items():
+                hourly_values[sgen_idx] = solar_pv_profile(hour, p_rated)
+            for sgen_idx, p_rated in wind_sgen_indices.items():
+                hourly_values[sgen_idx] = wind_power_profile(p_rated)
+            profile_data[hour] = hourly_values
+
+        profiles = pd.DataFrame.from_dict(profile_data, orient="index")
+        if 0 in profiles.index:
+            for sgen_idx in profiles.columns:
+                p_val = profiles.loc[0, sgen_idx]
+                net.sgen.at[sgen_idx, "p_mw"] = p_val
+                if sgen_idx in wind_sgen_indices:
+                    net.sgen.at[sgen_idx, "q_mvar"] = 0.1 * p_val
+                else:
+                    net.sgen.at[sgen_idx, "q_mvar"] = 0.0
+
+    fault_buses = net.bus.index.tolist()
+    return net, fault_buses, net.line.index.tolist(), net.load.index.tolist(), profiles
+
+
+
+
+NETWORK_BUILDERS = {
+    "ieee38": build_ieee38_net,
+    "ieee68": build_ieee68_net,
+    "ieee123": build_ieee123_net,
+}
+
+
+# =========================
+# Simulation and dataset generation
+# =========================
+
+def run_fault_and_extract(net, fault_bus, fault_type, case, rf_ohm, monitored_buses):
+    # pandapower's keyword for fault resistance is r_fault_ohm. There is no
+    # fallback without it: silently dropping the resistance would turn every
+    # sample into a bolted fault.
+    try:
+        sc.calc_sc(net, bus=fault_bus, fault=fault_type, case=case, branch_results=True, r_fault_ohm=rf_ohm)
+    except Exception:
+        return None
+
+    if net.res_bus_sc.empty or net.res_line_sc.empty:
+        return None
+    return extract_monitored_line_current_features(net, net.res_line_sc, "ikss_ka", monitored_buses)
+
+
+def run_powerflow_and_extract(net, monitored_buses):
+    try:
+        pp.runpp(net)
+    except Exception:
+        return None
+
+    if net.res_line.empty:
+        return None
+    return extract_monitored_line_current_features(net, net.res_line, "i_ka", monitored_buses)
+
+
+def generate_dataset(
+    N=200,
+    vre_percent=0,
+    random_seed=42,
+    use_cache=True,
+    dataset=None,
+    cache_dir=None,
+    cache_tag=None,
+):
+    """
+    Generate N valid samples of monitored line-current features for the chosen
+    IEEE network. Labels are fault types: "3ph", "2ph", "1ph" or "NF" (no fault).
+
+    dataset:   "ieee38", "ieee68" or "ieee123" (defaults to SELECTED_DATASET)
+    cache_dir: folder for CSV caches (defaults to CACHE_DIR)
+    cache_tag: prefix for cache file names (defaults to the original pipeline tag)
+    """
+    dataset = (dataset or SELECTED_DATASET).lower()
+    if dataset not in VALID_DATASET_CHOICES:
+        raise ValueError("dataset must be one of {}".format(sorted(VALID_DATASET_CHOICES)))
+
+    cache_dir = cache_dir or CACHE_DIR
+    cache_tag = cache_tag or default_cache_tag(dataset)
+    monitored_buses = DATASET_MONITORED_BUSES[dataset]
+
+    cache_name = "{}{}_dataset_vre{}_N{}_seed{}.csv".format(
+        cache_tag, DATASET_CACHE_SUFFIX.get(dataset, ""), vre_percent, N, random_seed
+    )
+    cache_path = os.path.join(cache_dir, cache_name)
+    if use_cache and os.path.exists(cache_path):
+        print("Loading cached dataset:", cache_path)
+        return pd.read_csv(cache_path)
+
+    set_all_seeds(random_seed)
+    net_builder = NETWORK_BUILDERS[dataset]
+    net_base, fault_buses, _, _, profiles = net_builder(
+        vre_percent=vre_percent,
+        dynamic_profile=(vre_percent > 0),
+        hours=24,
+        seed=random_seed,
+    )
+
+    data = []
+    labels = []
+    hours = []
+    buses = []
+    rf_values = []
+    cases = []
+
+    print("Generating {} VRE{} dataset, target valid samples: {}".format(dataset, vre_percent, N))
+    attempts = 0
+    max_attempts = N * 12
+
+    while len(data) < N and attempts < max_attempts:
+        attempts += 1
+        net = copy.deepcopy(net_base)
+
+        hour = random.randint(0, 23)
+        if vre_percent > 0 and profiles is not None and not net.sgen.empty:
+            hourly_profile = profiles.loc[hour]
+            for sgen_idx in hourly_profile.index:
+                p_actual = hourly_profile[sgen_idx]
+                net.sgen.at[sgen_idx, "p_mw"] = p_actual
+                if "Wind" in str(net.sgen.at[sgen_idx, "name"]):
+                    net.sgen.at[sgen_idx, "q_mvar"] = 0.1 * p_actual
+                else:
+                    net.sgen.at[sgen_idx, "q_mvar"] = 0.0
+
+        if not net.load.empty:
+            for ld_idx in net.load.index:
+                scale = random.uniform(0.5, 1.5)
+                net.load.at[ld_idx, "p_mw"] *= scale
+                net.load.at[ld_idx, "q_mvar"] *= scale
+
+        fault_type = random.choice(FAULT_TYPES)
+        fault_bus = None
+        case = ""
+        rf_ohm = 0.0
+
+        if fault_type == "NF":
+            features = run_powerflow_and_extract(net, monitored_buses)
+        else:
+            fault_bus = random.choice(fault_buses)
+            case = random.choice(FAULT_CASES)
+            rf_ohm = min(5.0, float(np.round(np.random.exponential(scale=0.5), 3)))
+            features = run_fault_and_extract(net, fault_bus, fault_type, case, rf_ohm, monitored_buses)
+
+        if features is not None:
+            data.append(features)
+            labels.append(fault_type)
+            hours.append(hour)
+            buses.append(fault_bus if fault_bus is not None else -1)
+            cases.append(case)
+            rf_values.append(rf_ohm)
+
+            if len(data) % 50 == 0:
+                print("  collected {}/{} valid samples".format(len(data), N))
+
+    if len(data) < N:
+        print("Warning: collected only {} valid samples after {} attempts.".format(len(data), attempts))
+
+    cols = monitored_feature_columns(include_hour=False)
+    df = pd.DataFrame(data, columns=cols)
+    df["label"] = labels
+    df["hour"] = hours
+    df["fault_bus"] = buses
+    df["case"] = cases
+    df["rf_ohm"] = rf_values
+    df["vre_percent"] = vre_percent
+    df["dataset"] = dataset
+
+    if use_cache:
+        os.makedirs(cache_dir, exist_ok=True)
+        tmp_cache_path = "{}.tmp.{}".format(cache_path, os.getpid())
+        df.to_csv(tmp_cache_path, index=False)
+        os.replace(tmp_cache_path, cache_path)
+        print("Saved dataset cache:", cache_path)
+
+    return df
+
+
+if __name__ == "__main__":
+    # Quick smoke test: small IEEE38 dataset without caching.
+    demo = generate_dataset(N=20, vre_percent=30, random_seed=14, use_cache=False, dataset="ieee38")
+    print(demo.head())
+    print(demo["label"].value_counts())
