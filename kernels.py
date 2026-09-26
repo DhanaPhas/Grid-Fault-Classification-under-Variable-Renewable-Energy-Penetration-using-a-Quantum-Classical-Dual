@@ -55,7 +55,7 @@ def _load_fake_backend(name=config.NOISY_FAKE_BACKEND):
         from qiskit_ibm_runtime import fake_provider
     except Exception as exc:
         raise ImportError(
-            "The noisy fidelityquantumkernel mode needs qiskit-ibm-runtime. "
+            "The noisy FQK mode needs qiskit-ibm-runtime. "
             "Import error: {}".format(exc)
         )
     if not hasattr(fake_provider, name):
@@ -72,8 +72,8 @@ def make_quantum_kernel(
     """
     ZZFeatureMap fidelity kernel.
 
-    mode="fidelitystatevectorkernel": exact, noiseless statevector simulation.
-    mode="fidelityquantumkernel":     ComputeUncompute sampling on a fake noisy backend.
+    mode="FSK": exact, noiseless statevector simulation.
+    mode="FQK": ComputeUncompute sampling on a fake noisy backend.
     """
     from qiskit.circuit.library import ZZFeatureMap
 
@@ -84,20 +84,20 @@ def make_quantum_kernel(
         parameter_prefix=config.QUANTUM_FEATUREMAP_PARAMETER_PREFIX,
     )
 
-    mode = mode.lower()
-    if mode == "fidelitystatevectorkernel":
+    mode = config.normalize_quantum_kernel_name(mode).lower()
+    if mode == "fsk":
         from qiskit_machine_learning.kernels import FidelityStatevectorKernel
 
         return FidelityStatevectorKernel(feature_map=feature_map)
 
-    if mode == "fidelityquantumkernel":
+    if mode == "fqk":
         try:
             from qiskit_ibm_runtime import SamplerV2
             from qiskit_machine_learning.kernels import FidelityQuantumKernel
             from qiskit_machine_learning.state_fidelities import ComputeUncompute
         except Exception as exc:
             raise ImportError(
-                "fidelityquantumkernel mode needs qiskit-machine-learning state_fidelities "
+                "FQK mode needs qiskit-machine-learning state_fidelities "
                 "and qiskit-ibm-runtime. Import error: {}".format(exc)
             )
         sampler = SamplerV2(_load_fake_backend())

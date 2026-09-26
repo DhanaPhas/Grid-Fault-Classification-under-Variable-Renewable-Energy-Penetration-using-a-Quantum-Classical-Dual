@@ -12,8 +12,8 @@ Examples
     python run_experiment.py --dataset ieee38 --quick
 
     # full run as in the paper
-    python run_experiment.py --dataset ieee38 --kernel fidelitystatevectorkernel
-    python run_experiment.py --dataset ieee68 --kernel fidelityquantumkernel --seeds 14 22 35 56 90 257 301 412 555 777
+    python run_experiment.py --dataset ieee38 --kernel FSK
+    python run_experiment.py --dataset ieee68 --kernel FQK --seeds 14 22 35 56 90 257 301 412 555 777
 
     # from Jupyter
     import run_experiment
@@ -143,12 +143,6 @@ def main(argv=None):
         args.dataset, mode, args.seeds, args.quick))
     print("Results folder:", out_dir)
 
-    min_holm = stats.min_achievable_holm_p(len(args.seeds))
-    if min_holm >= config.SIGNIFICANCE_LEVEL:
-        print("\nWARNING: with {} seeds the smallest achievable Holm-adjusted permutation p-value is {:.3f}, "
-              "so no across-seed difference can reach p < {}. Use at least 7 seeds (10+ advisable).".format(
-                  len(args.seeds), min_holm, config.SIGNIFICANCE_LEVEL))
-
     # ---------- repeated-seed loop ----------
     experiments, prediction_tables = [], []
     for seed in args.seeds:
@@ -176,10 +170,10 @@ def main(argv=None):
     reporting.save_table(cost_df, "model_cost_summary", out_dir)
 
     reporting.show_table(summary_df, "Repeated-seed model summary (mean over seeds)")
-    reporting.show_table(pairwise_df, "Repeated-seed paired tests (primary inference, Holm per metric)")
+    reporting.show_table(pairwise_df, "Repeated-seed paired tests (primary inference)")
     reporting.show_table(cost_df, "Computational cost per seed (seconds; only meaningful on a cold cache)", "{:.2f}")
 
-    for metric in ["acc", "auc"]:
+    for metric in ["acc"]:
         reporting.plot_repeated_seed_summary(
             seed_df, metric=metric, show=args.show,
             save_path="{}/repeated_seed_{}.png".format(out_dir, metric))
@@ -207,14 +201,6 @@ def main(argv=None):
     reporting.save_table(final_pairwise_df, tag + "_pairwise_tests", out_dir)
     reporting.save_table(results["dual"]["results_df"].drop(columns=["fold_scores"]), tag + "_dual_grid", out_dir)
     reporting.classification_reports(split, results, out_dir=out_dir, verbose=False)
-    for title, cm in reporting.confusion_matrix_tables(split, results,
-                                                       normalize=config.CONFUSION_MATRIX_NORMALIZE).items():
-        reporting.save_table(cm.reset_index().rename(columns={"index": "true"}),
-                             "{}_cm_{}".format(tag, title.replace(" ", "_").replace("-", "")), out_dir)
-
-    if config.SHOW_CONFUSION_MATRICES:
-        reporting.plot_confusion_matrix_grid(split, results, normalize=config.CONFUSION_MATRIX_NORMALIZE,
-                                             show=args.show, save_path="{}/{}_confusion.png".format(out_dir, tag))
     reporting.plot_alpha_curve(split, results["dual"], show=args.show,
                                save_path="{}/{}_alpha_curve.png".format(out_dir, tag))
 

@@ -29,15 +29,31 @@ import numpy as np
 SELECTED_DATASET = "ieee38"
 
 # Supported quantum kernels:
-#   "fidelitystatevectorkernel" - ideal (noiseless) statevector kernel
-#   "fidelityquantumkernel"     - ComputeUncompute with the fake noisy backend
-SELECTED_QUANTUM_KERNEL = "fidelitystatevectorkernel"
+#   "FSK" - ideal (noiseless) statevector kernel
+#   "FQK" - ComputeUncompute with the fake noisy backend
+SELECTED_QUANTUM_KERNEL = "FSK"
 
 VALID_DATASET_CHOICES = {"ieee38", "ieee68", "ieee123"}
-VALID_QUANTUM_KERNEL_CHOICES = {"fidelitystatevectorkernel", "fidelityquantumkernel"}
+VALID_QUANTUM_KERNEL_CHOICES = {"FSK", "FQK"}
 
-# Fake backend used when SELECTED_QUANTUM_KERNEL == "fidelityquantumkernel".
+# Legacy aliases accepted for compatibility with older runs and cached metadata.
+LEGACY_QUANTUM_KERNEL_ALIASES = {
+    "fidelitystatevectorkernel": "FSK",
+    "fidelityquantumkernel": "FQK",
+    "fsk": "FSK",
+    "fqk": "FQK",
+}
+
+# Fake backend used when SELECTED_QUANTUM_KERNEL == "FQK".
 NOISY_FAKE_BACKEND = "FakeBrooklynV2"
+
+
+def normalize_quantum_kernel_name(name):
+    """Map legacy long names to the compact canonical aliases used in this project."""
+    if name is None:
+        return None
+    normalized = str(name).strip()
+    return LEGACY_QUANTUM_KERNEL_ALIASES.get(normalized.lower(), normalized.upper())
 
 
 # =========================
@@ -118,7 +134,7 @@ SIGNIFICANCE_LEVEL = 0.05
 # Reporting
 # =========================
 
-SHOW_CONFUSION_MATRICES = True
+SHOW_CONFUSION_MATRICES = False
 CONFUSION_MATRIX_NORMALIZE = None  # None for counts, "true" for row-normalized rates.
 
 
@@ -147,6 +163,8 @@ def make_cache_pipeline_tag(dataset, quantum_kernel):
 
 SELECTED_DATASET = SELECTED_DATASET.lower()
 SELECTED_QUANTUM_KERNEL = SELECTED_QUANTUM_KERNEL.lower()
+
+SELECTED_QUANTUM_KERNEL = normalize_quantum_kernel_name(SELECTED_QUANTUM_KERNEL)
 
 if SELECTED_DATASET not in VALID_DATASET_CHOICES:
     raise ValueError("SELECTED_DATASET must be one of {}".format(sorted(VALID_DATASET_CHOICES)))
@@ -179,7 +197,7 @@ def set_run_options(dataset=None, quantum_kernel=None):
             raise ValueError("dataset must be one of {}".format(sorted(VALID_DATASET_CHOICES)))
         SELECTED_DATASET = dataset
     if quantum_kernel is not None:
-        quantum_kernel = quantum_kernel.lower()
+        quantum_kernel = normalize_quantum_kernel_name(quantum_kernel)
         if quantum_kernel not in VALID_QUANTUM_KERNEL_CHOICES:
             raise ValueError("quantum_kernel must be one of {}".format(sorted(VALID_QUANTUM_KERNEL_CHOICES)))
         SELECTED_QUANTUM_KERNEL = quantum_kernel

@@ -14,7 +14,7 @@ import os
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import classification_report
 
 import config
 from models import TEST_SETS
@@ -154,21 +154,6 @@ def classification_reports(split, results, out_dir=None, verbose=True):
     return df
 
 
-# =========================
-# Confusion matrices
-# =========================
-
-def confusion_matrix_tables(split, results, normalize=None):
-    labels = sorted(np.unique(split["y_train"]))
-    tables = {}
-    for suffix, dataset_name in TEST_SETS:
-        for model_name, key in MODEL_KEYS:
-            cm = confusion_matrix(split["y_test" + suffix], results[key]["y_pred" + suffix],
-                                  labels=labels, normalize=normalize)
-            tables["{} - {}".format(dataset_name, model_name)] = pd.DataFrame(
-                cm, index=["true_" + l for l in labels], columns=["pred_" + l for l in labels])
-    return tables
-
 
 def _finish_figure(fig, save_path, show):
     if save_path:
@@ -178,39 +163,6 @@ def _finish_figure(fig, save_path, show):
         plt.show()
     else:
         plt.close(fig)
-
-
-def plot_confusion_matrix_grid(split, results, normalize=None, save_path=None, show=True):
-    labels = sorted(np.unique(split["y_train"]))
-    fig, axes = plt.subplots(len(TEST_SETS), len(MODEL_KEYS),
-                             figsize=(4.2 * len(MODEL_KEYS), 3.8 * len(TEST_SETS)), squeeze=False)
-    fmt = ".2f" if normalize else "d"
-    im = None
-    for i, (suffix, dataset_name) in enumerate(TEST_SETS):
-        for j, (model_name, key) in enumerate(MODEL_KEYS):
-            ax = axes[i][j]
-            cm = confusion_matrix(split["y_test" + suffix], results[key]["y_pred" + suffix],
-                                  labels=labels, normalize=normalize)
-            im = ax.imshow(cm, interpolation="nearest", cmap="Blues")
-            ax.set_title("{}\n{}".format(dataset_name, model_name), fontsize=10)
-            ax.set_xlabel("Predicted label")
-            ax.set_ylabel("True label")
-            ax.set_xticks(range(len(labels)))
-            ax.set_yticks(range(len(labels)))
-            ax.set_xticklabels(labels, rotation=45, ha="right")
-            ax.set_yticklabels(labels)
-            threshold = cm.max() / 2.0 if cm.size else 0.0
-            for r in range(cm.shape[0]):
-                for c in range(cm.shape[1]):
-                    ax.text(c, r, format(cm[r, c], fmt), ha="center", va="center", fontsize=9,
-                            color="white" if cm[r, c] > threshold else "black")
-    fig.tight_layout()
-    if im is not None:
-        fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.82)
-    fig.suptitle("Confusion matrices: {}, {}, seed {} ({})".format(
-        config.SELECTED_DATASET, config.QUANTUM_KERNEL_MODE, split["seed"],
-        "counts" if normalize is None else "normalized={}".format(normalize)), y=1.02)
-    _finish_figure(fig, save_path, show)
 
 
 # =========================
@@ -241,8 +193,8 @@ def plot_alpha_curve(split, dual_result, save_path=None, show=True):
 
 
 def plot_repeated_seed_summary(seed_df, metric="acc", save_path=None, show=True):
-    """Mean +/- std across seeds for each model and test set ("acc" or "auc")."""
-    groups = [("CV", "cv")] if metric == "acc" else []
+    """Mean +/- std across seeds for each model and test set."""
+    groups = [("CV", "cv")]
     groups += [(name.split()[0], metric + suffix) for suffix, name in TEST_SETS]
     width = 0.8 / len(MODEL_KEYS)
     x = np.arange(len(groups))
@@ -254,7 +206,7 @@ def plot_repeated_seed_summary(seed_df, metric="acc", save_path=None, show=True)
                capsize=3, label=model_name)
     ax.set_xticks(x)
     ax.set_xticklabels([g[0] for g in groups])
-    ax.set_ylabel("Accuracy" if metric == "acc" else "Macro OvR ROC AUC")
+    ax.set_ylabel("Accuracy")
     ax.set_title("Mean +/- std over {} seeds, {}, {}".format(
         len(seed_df), config.SELECTED_DATASET, config.QUANTUM_KERNEL_MODE))
     ax.legend()

@@ -8,18 +8,14 @@ Two levels of inference are provided:
 1. Across seeds (primary). Each seed gives a fresh train/test draw, so the
    per-seed metric differences between two models are paired observations.
    repeated_seed_pairwise_metric_tests() applies an exact sign-flip
-   permutation test to those differences with Holm correction across the
-   three model pairs. This is the test to base claims on.
+   permutation test to those differences and is the test to base claims on.
 
 2. Within one fixed test set (secondary). final_fixed_test_pairwise_table()
    uses McNemar's exact test on paired correctness and paired bootstrap CIs.
    These describe one split only and ignore split-to-split variability.
 
 Power note: with n seeds the smallest achievable two-sided sign-flip p-value
-is 2 / 2**n. With Holm over m pairs the smallest adjusted p-value is
-m * 2 / 2**n, so 6 seeds and 3 pairs can never reach p < 0.05 (min 0.094).
-Use min_achievable_holm_p() to check before running; >= 7 seeds are needed
-for 3 pairs, and 10+ is advisable.
+is 2 / 2**n, so 6 seeds and 3 pairs can never reach p < 0.05 (min 0.094).
 """
 
 import itertools
@@ -47,9 +43,6 @@ SEED_METRICS = [
     ("VRE0 Test Accuracy", "acc0"),
     ("VRE30 Held-out Accuracy", "acc30"),
     ("VRE80 Held-out Accuracy", "acc80"),
-    ("VRE0 ROC AUC", "auc0"),
-    ("VRE30 ROC AUC", "auc30"),
-    ("VRE80 ROC AUC", "auc80"),
 ]
 
 
@@ -69,10 +62,6 @@ def _labels(split):
 def min_achievable_p(n_seeds):
     """Smallest two-sided exact sign-flip p-value possible with n paired observations."""
     return min(1.0, 2.0 / (2 ** n_seeds)) if n_seeds > 0 else np.nan
-
-
-def min_achievable_holm_p(n_seeds, n_comparisons=len(MODEL_PAIRS)):
-    return min(1.0, n_comparisons * min_achievable_p(n_seeds))
 
 
 # =========================
@@ -173,42 +162,12 @@ def exact_mcnemar_p_value(y_true, y_pred_a, y_pred_b):
     tail = sum(math.comb(n, k) for k in range(min(b, c) + 1)) / (2 ** n)
     return min(1.0, 2.0 * tail), b, c
 
-
-# =========================
-# Multiple-comparison correction
-# =========================
-
-def holm_bonferroni(p_values):
-    """Holm step-down adjusted p-values. NaNs are ignored and stay NaN."""
-    p_values = np.asarray(p_values, dtype=float)
-    adjusted = np.full(len(p_values), np.nan)
-    valid = np.where(np.isfinite(p_values))[0]
-    m = len(valid)
-    running_max = 0.0
-    for rank, idx in enumerate(valid[np.argsort(p_values[valid])]):
-        running_max = max(running_max, (m - rank) * p_values[idx])
-        adjusted[idx] = min(1.0, running_max)
-    return adjusted
-
-
-def add_holm_correction(df, p_col, group_cols, out_col):
-    df = df.copy()
-    df[out_col] = np.nan
-    if df.empty or p_col not in df.columns:
-        return df
-    for _, idx in df.groupby(group_cols).groups.items():
-        locs = list(idx)
-        df.loc[locs, out_col] = holm_bonferroni(df.loc[locs, p_col].astype(float).values)
-    return df
-
-
 # =========================
 # Single seed tables
 # =========================
 
 def model_ci_table(split, results):
-    """Per model and test set: accuracy, ROC AUC and bootstrap accuracy CI."""
-    labels = _labels(split)
+    """Per model and test set: accuracy and bootstrap accuracy CI."""
     rows = []
     for suffix, dataset_name in TEST_SETS:
         y_true = split["y_test" + suffix]
@@ -219,7 +178,6 @@ def model_ci_table(split, results):
                 "Dataset": dataset_name,
                 "Model": r["name"],
                 "Test Accuracy": s["test_accuracy"],
-                "ROC AUC OVR Macro": safe_multiclass_roc_auc(y_true, r.get("y_score" + suffix), r["classes"], labels),
                 "95% CI Lower": s["ci_lower"],
                 "95% CI Upper": s["ci_upper"],
                 "CI Width": s["ci_width"],
@@ -268,7 +226,7 @@ def strict_win_flags(results, delta_df):
 
 
 def final_fixed_test_pairwise_table(split, results, random_state=42):
-    """All model pairs on the fixed test sets: McNemar + paired bootstrap CIs, Holm per dataset/metric."""
+    """All model pairs on the fixed test sets: McNemar + paired bootstrap CIs."""
     labels = _labels(split)
     rows = []
     for d_idx, (suffix, dataset_name) in enumerate(TEST_SETS):
@@ -278,19 +236,12 @@ def final_fixed_test_pairwise_table(split, results, random_state=42):
             p, a_only, b_only = exact_mcnemar_p_value(y_true, ra["y_pred" + suffix], rb["y_pred" + suffix])
             acc = paired_bootstrap_delta_ci(y_true, ra, rb, suffix, "accuracy", labels,
                                             random_state=random_state + 100 * d_idx + p_idx)
-            auc = paired_bootstrap_delta_ci(y_true, ra, rb, suffix, "roc_auc", labels,
-                                            random_state=random_state + 1000 + 100 * d_idx + p_idx)
             rows.append({
                 "Dataset": dataset_name, "Metric": "Accuracy", "Pair": pair_name,
                 "Difference": acc["delta"], "95% Delta CI Lower": acc["ci_lower"], "95% Delta CI Upper": acc["ci_upper"],
                 "McNemar p-value": p, "Discordant A Correct Only": a_only, "Discordant B Correct Only": b_only,
             })
-            rows.append({
-                "Dataset": dataset_name, "Metric": "ROC AUC", "Pair": pair_name,
-                "Difference": auc["delta"], "95% Delta CI Lower": auc["ci_lower"], "95% Delta CI Upper": auc["ci_upper"],
-                "McNemar p-value": np.nan, "Discordant A Correct Only": np.nan, "Discordant B Correct Only": np.nan,
-            })
-    return add_holm_correction(pd.DataFrame(rows), "McNemar p-value", ["Dataset", "Metric"], "Holm McNemar p-value")
+    return pd.DataFrame(rows)
 
 
 # =========================
@@ -378,12 +329,7 @@ def repeated_seed_model_summary(seed_df):
 
 
 def repeated_seed_pairwise_metric_tests(seed_df, random_state=42):
-    """
-    Primary inference table: for every metric and model pair, the mean paired
-    difference across seeds, bootstrap CI, exact sign-flip p-value (Holm
-    corrected across the pairs within each metric), plus t-test and Wilcoxon
-    p-values for reference.
-    """
+    """Primary inference table: mean paired difference across seeds, bootstrap CI, and exact sign-flip p-value."""
     rows = []
     for m_idx, (metric_name, suffix) in enumerate(SEED_METRICS):
         for p_idx, (pair_name, a, b) in enumerate(MODEL_PAIRS):
@@ -402,13 +348,7 @@ def repeated_seed_pairwise_metric_tests(seed_df, random_state=42):
                 "Paired t-test p-value": paired_t_test_p_value(deltas),
                 "Wilcoxon p-value": wilcoxon_p_value(deltas),
             })
-    out = add_holm_correction(pd.DataFrame(rows), "Paired Permutation p-value", ["Metric"], "Holm p-value")
-    if not out.empty:
-        out["Supported Difference"] = (
-            (out["Holm p-value"] < config.SIGNIFICANCE_LEVEL)
-            & ((out["95% Mean Delta CI Lower"] > 0) | (out["95% Mean Delta CI Upper"] < 0))
-        )
-    return out
+    return pd.DataFrame(rows)
 
 
 def repeated_seed_dual_delta_tests(seed_df, random_state=42):

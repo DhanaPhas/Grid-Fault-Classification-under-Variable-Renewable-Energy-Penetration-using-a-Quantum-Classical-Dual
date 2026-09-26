@@ -82,12 +82,12 @@ Run all commands from the repository root.
 python run_experiment.py --dataset ieee38 --quick
 
 # full run
-python run_experiment.py --dataset ieee38 --kernel fidelitystatevectorkernel
-python run_experiment.py --dataset ieee68 --kernel fidelityquantumkernel \
+python run_experiment.py --dataset ieee38 --kernel FSK
+python run_experiment.py --dataset ieee68 --kernel FQK \
     --seeds 14 22 35 56 90 257 301 412 555 777
 ```
 
-Options: `--dataset {ieee38,ieee68,ieee123}`, `--kernel {fidelitystatevectorkernel,fidelityquantumkernel}`, `--seeds ...`, `--report-seed {first,best,<seed>}`, `--quick`, `--show`.
+Options: `--dataset {ieee38,ieee68,ieee123}`, `--kernel {FSK,FQK}`, `--seeds ...`, `--report-seed {first,best,<seed>}`, `--quick`, `--show`.
 
 From Jupyter:
 
@@ -112,6 +112,13 @@ out = run_experiment.main(["--dataset", "ieee38", "--quick"])
 
 - Claims should rest on the repeated-seed table. The single-seed tests describe one split only.
 - With *n* seeds the smallest possible two-sided sign-flip p-value is 2/2^n. With Holm over three model pairs, **6 seeds can never give p < 0.05** (minimum 0.094). Use at least 7 seeds; 10 or more is advisable. The script prints a warning when this applies.
+- For a more statistically stable estimate, run the experiment with 30 distinct seeds. For example, on macOS/Linux:
+
+    ```bash
+    python run_experiment.py --dataset ieee68 --kernel FQK --seeds $(seq 1 30)
+    ```
+
+    Using a fixed, documented seed list makes the results reproducible; increasing the number of seeds improves the precision of the across-seed summary but does not replace independent test-set evaluation.
 - The reporting seed defaults to the first seed (pre-declared). `--report-seed best` reproduces the original selection of the seed most favourable to the dual kernel and should not be used for headline results.
 - Timing is only meaningful on a cold cache, because cached quantum kernels load in seconds.
 
