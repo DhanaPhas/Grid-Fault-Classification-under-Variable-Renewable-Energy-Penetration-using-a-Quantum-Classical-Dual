@@ -71,6 +71,8 @@ Main package versions used for the paper:
 
 Installing `numba` is optional but speeds up pandapower considerably.
 
+**Noisy quantum backend note:** Running the noisy quantum-backend configuration requires modifying the Qiskit Machine Learning source file `compute_uncompute.py`. A standard, unmodified package installation is not sufficient for that configuration. This repository does not automatically apply that third-party source-code modification; the ideal statevector configuration does not require it.
+
 ## Usage
 
 Run all commands from the repository root.
