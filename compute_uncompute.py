@@ -9,6 +9,8 @@
 # Any modifications or derivative works of this code must retain this
 # copyright notice, and modified files need to carry a notice indicating
 # that they have been altered from the originals.
+
+# Modified by Dhana Phassadawongse <dhana.p_s24@vistec.ac.th> for using valid transpiled backend 
 """
 Compute-uncompute fidelity interface using primitives
 """
