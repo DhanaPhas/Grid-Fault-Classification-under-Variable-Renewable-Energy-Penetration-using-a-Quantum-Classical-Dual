@@ -14,7 +14,7 @@ Fault currents are computed with pandapower's IEC 60909 short-circuit calculatio
 2. **Train/test design.** Models are trained on VRE0 (no renewables) only. They are tested on an independent VRE0 set and on held-out VRE30 and VRE80 sets, which measures robustness to renewable penetration the model never saw.
 3. **Preprocessing** (`preprocessing.py`). StandardScaler → PCA (95% variance) → MinMax scaling to [0, π], fit on VRE0 training data only.
 4. **Models.** Classical SVC (RBF / polynomial / linear), quantum SVC with a ZZFeatureMap fidelity kernel, and a dual kernel `K = α·K_quantum + (1 − α)·K_classical` with α selected by cross-validation.
-5. **Evaluation.** Bootstrap confidence intervals, McNemar tests on a fixed test set, and paired permutation tests across predefined seeds with Holm correction.
+5. **Evaluation.** Bootstrap confidence intervals, McNemar tests on a fixed test set, and paired permutation tests across predefined seeds. ROC AUC is also reported from SVC decision scores.
 
 ## Networks
 
@@ -39,8 +39,8 @@ VRE30 and VRE80 mean installed renewable capacity equal to 30% and 80% of the to
 ├── preprocessing.py     # scaling + PCA split builder
 ├── kernels.py           # classical and quantum kernels, kernel caching
 ├── models.py            # CV tuning for classical, quantum and dual-kernel SVC
-├── stats.py             # bootstrap CIs, permutation / McNemar tests, Holm correction
-├── reporting.py         # tables, classification reports, confusion matrices, figures
+├── stats.py             # bootstrap CIs, permutation / McNemar tests
+├── reporting.py         # tables, classification reports, figures
 ├── run_experiment.py    # command-line entry point for the full pipeline
 ├── requirements.txt
 └── README.md
@@ -100,18 +100,19 @@ out = run_experiment.main(["--dataset", "ieee38", "--quick"])
 
 | File | Content |
 |---|---|
-| `repeated_seed_all_pairwise_metric_tests.csv` | **Primary result.** Mean paired difference across seeds for every model pair and metric, exact sign-flip permutation p-value with Holm correction, bootstrap CI, t-test and Wilcoxon for reference |
-| `repeated_seed_model_summary.csv` | Mean, std, min and max of each metric across seeds |
-| `seed_summary.csv`, `seed_level_predictions.csv` | Per-seed metrics and every individual test prediction |
+| `repeated_seed_all_pairwise_metric_tests.csv` | **Primary result.** Mean paired difference across seeds for each model pair and accuracy metric, sign-flip permutation p-value (exact for up to 20 seeds, Monte Carlo beyond that; unadjusted), bootstrap CI, t-test and Wilcoxon for reference |
+| `repeated_seed_dual_minus_classical_tests.csv` | Paired accuracy differences between dual and classical models across seeds |
+| `repeated_seed_model_summary.csv` | Mean, std, min and max of cross-validation and test accuracy metrics across seeds |
+| `seed_summary.csv`, `seed_level_predictions.csv` | Per-seed metrics (including ROC AUC) and every individual test prediction |
 | `model_cost_summary.csv` | Tuning time per seed; the "Dual (end-to-end)" row includes the classical and quantum stages the dual kernel depends on |
-| `reporting_seed_*` | Detailed single-split report: model comparison, bootstrap CIs, McNemar tests, classification reports, confusion matrices, alpha curve |
-| `repeated_seed_acc.png`, `repeated_seed_auc.png` | Mean ± std across seeds |
+| `reporting_seed_*` | Detailed single-split tables: model comparison, bootstrap CIs, fixed-test pairwise tests, dual-kernel grid, and classification reports; an alpha-curve figure is also saved |
+| `repeated_seed_acc.png` | Mean ± std accuracy across seeds |
 | `run_config.json` | Arguments, all config values and package versions for the run |
 
 ### Statistical notes
 
 - Claims should rest on the repeated-seed table. The single-seed tests describe one split only.
-- With *n* seeds the smallest possible two-sided sign-flip p-value is 2/2^n. With Holm over three model pairs, **6 seeds can never give p < 0.05** (minimum 0.094). Use at least 7 seeds; 10 or more is advisable. The script prints a warning when this applies.
+- The pairwise permutation p-values are not adjusted for multiple comparisons. Interpret them accordingly and prioritize effect sizes and confidence intervals. With *n* seeds, the smallest possible two-sided exact sign-flip p-value is 2/2^n; 10 or more seeds is advisable for more stable estimates.
 - For a more statistically stable estimate, run the experiment with 30 distinct seeds. For example, on macOS/Linux:
 
     ```bash
@@ -147,4 +148,6 @@ If you use this repository in your research, please cite:
 
 ## License
 
-[License to be added]
+This project is released under the [MIT License](LICENSE), a permissive open-source license. You are free to use, copy, modify, merge, publish and distribute the code, including for reproducing, verifying or extending the results reported in the paper, provided the original copyright notice and license text are included in any copies or substantial portions of the software.
+
+The code and data-generation pipeline are made openly available to support the reproducibility of the published results, in line with the open-science and reproducibility expectations of IEEE Access. If you use this code in academic work, please cite the paper (see [Citation](#citation)).
