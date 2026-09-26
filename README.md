@@ -6,7 +6,7 @@ This repository contains the code and data-generation pipeline for the paper "Gr
 
 This work investigates quantum-classical dual-kernel learning for classifying power-system faults under different levels of variable renewable energy (VRE) penetration. The objective is to evaluate a quantum-classical dual-kernel SVM across modified IEEE 38-, 68- and 123-bus networks, operating conditions and fault-feature representations, rather than to establish a quantum advantage over classical machine learning.
 
-Fault currents are computed with pandapower's IEC 60909 short-circuit calculation. Quantum kernels are built with Qiskit (ideal statevector and noisy fake-backend variants), and preprocessing, training and evaluation use scikit-learn. Performance is assessed with cross-validation, held-out test accuracy, ROC AUC and repeated-seed paired statistical tests.
+Fault currents are computed with pandapower's IEC 60909 short-circuit calculation. Quantum kernels are built with Qiskit (ideal statevector and noisy fake-backend variants), and preprocessing, training and evaluation use scikit-learn. Performance is assessed with cross-validation, held-out test accuracy and repeated-seed paired statistical tests.
 
 ## Method summary
 
@@ -14,7 +14,7 @@ Fault currents are computed with pandapower's IEC 60909 short-circuit calculatio
 2. **Train/test design.** Models are trained on VRE0 (no renewables) only. They are tested on an independent VRE0 set and on held-out VRE30 and VRE80 sets, which measures robustness to renewable penetration the model never saw.
 3. **Preprocessing** (`preprocessing.py`). StandardScaler → PCA (95% variance) → MinMax scaling to [0, π], fit on VRE0 training data only.
 4. **Models.** Classical SVC (RBF / polynomial / linear), quantum SVC with a ZZFeatureMap fidelity kernel, and a dual kernel `K = α·K_quantum + (1 − α)·K_classical` with α selected by cross-validation.
-5. **Evaluation.** Bootstrap confidence intervals, McNemar tests on a fixed test set, and paired permutation tests across predefined seeds. ROC AUC is also reported from SVC decision scores.
+5. **Evaluation.** Bootstrap confidence intervals, McNemar tests on a fixed test set, and paired permutation tests across predefined seeds.
 
 ## Networks
 
@@ -105,7 +105,7 @@ out = run_experiment.main(["--dataset", "ieee38", "--quick"])
 | `repeated_seed_all_pairwise_metric_tests.csv` | **Primary result.** Mean paired difference across seeds for each model pair and accuracy metric, sign-flip permutation p-value (exact for up to 20 seeds, Monte Carlo beyond that; unadjusted), bootstrap CI, t-test and Wilcoxon for reference |
 | `repeated_seed_dual_minus_classical_tests.csv` | Paired accuracy differences between dual and classical models across seeds |
 | `repeated_seed_model_summary.csv` | Mean, std, min and max of cross-validation and test accuracy metrics across seeds |
-| `seed_summary.csv`, `seed_level_predictions.csv` | Per-seed metrics (including ROC AUC) and every individual test prediction |
+| `seed_summary.csv`, `seed_level_predictions.csv` | Per-seed metrics and every individual test prediction |
 | `model_cost_summary.csv` | Tuning time per seed; the "Dual (end-to-end)" row includes the classical and quantum stages the dual kernel depends on |
 | `reporting_seed_*` | Detailed single-split tables: model comparison, bootstrap CIs, fixed-test pairwise tests, dual-kernel grid, and classification reports; an alpha-curve figure is also saved |
 | `repeated_seed_acc.png` | Mean ± std accuracy across seeds |
